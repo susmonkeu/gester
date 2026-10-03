@@ -29,7 +29,7 @@ NORMAL_SPEED = 0.004      # how fast the rainbow cycles
 PARTY_SPEED = 0.02        # rainbow speed in Party Mode
 NUM_PARTICLES = 40
 NUM_JESTERS = 6
-VERSION = "1.0.0"          # change this each update so you can see it worked
+VERSION = "1.0.1"          # change this each update so you can see it worked
 
 HOVER_SOUND = "hover.wav"
 CLICK_SOUND = "click.wav"
@@ -143,13 +143,21 @@ class DiscordLink:
         if discord is None:
             self.problem = "discord.py not found by this Python (see terminal)"
             return
+        config_path = find_file("config.json")
+        if config_path is None:
+            self.problem = "config.json not found next to Gester.exe"
+            return
         try:
-            with open(find_file("config.json")) as f:
+            with open(config_path) as f:
                 config = json.load(f)
+        except Exception:
+            self.problem = "config.json has a typo (check quotes and commas)"
+            return
+        try:
             self.token = config["token"]
             self.channel_id = int(config["channel_id"])
         except Exception:
-            self.problem = "config.json is missing or wrong (see top of gester.py)"
+            self.problem = "config.json needs a token and a channel_id"
             return
         threading.Thread(target=self.run, daemon=True).start()
 
