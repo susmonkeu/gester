@@ -21,6 +21,7 @@ RUN:  python gester.py
 """
 import tkinter as tk
 import colorsys, math, random, os, sys, json, asyncio, threading
+from collections import deque
 
 # ---------- SETTINGS (change these to experiment!) ----------
 WIDTH, HEIGHT = 720, 480
@@ -29,7 +30,13 @@ NORMAL_SPEED = 0.004      # how fast the rainbow cycles
 PARTY_SPEED = 0.02        # rainbow speed in Party Mode
 NUM_PARTICLES = 40
 NUM_JESTERS = 6
-VERSION = "1.0.1"          # change this each update so you can see it worked
+
+# MULTIPLAYER: paste your Discord channel IDs here (0 = that feature is off)
+SYNC_CHANNEL_ID = 1556072377530458174      # the channel that keeps everyone's name list in sync
+CHAT_CHANNEL_ID = 1556072398111903784      # the channel the chat box uses
+USE_MESSAGE_CONTENT_INTENT = False   # only set True if the chat shows blank messages
+CHAT_W = 300             # how much wider the window gets when the chat is open
+VERSION = "1.1.0"          # change this each update so you can see it worked
 
 HOVER_SOUND = "hover.wav"
 CLICK_SOUND = "click.wav"
@@ -125,6 +132,46 @@ def save_names(names):
         print("Could not save names.json")
 
 
+# ---------- SHARED NAME LIST + USERNAME ----------
+USER_FILE = os.path.join(HERE, "username.txt")
+SEEDED_FILE = os.path.join(HERE, "synced.flag")
+
+
+def load_username():
+    try:
+        with open(USER_FILE) as f:
+            return f.read().strip()[:20] or "Guest"
+    except OSError:
+        return "Guest"
+
+
+def save_username(name):
+    try:
+        with open(USER_FILE, "w") as f:
+            f.write(name)
+    except OSError:
+        pass
+
+
+def apply_event(names, kind, name=""):
+    """Change a name list the way a shared ADD / REMOVE / CLEAR event says."""
+    lowered = [n.lower() for n in names]
+    if kind == "ADD" and name and name.lower() not in lowered:
+        names.append(name)
+    elif kind == "REMOVE" and name.lower() in lowered:
+        names.pop(lowered.index(name.lower()))
+    elif kind == "CLEAR":
+        names.clear()
+
+
+def parse_sync(content):
+    """'GESTER-SYNC abc123 ADD bob' -> ('abc123', 'ADD', 'bob'), or None."""
+    parts = content.split(" ", 3)
+    if len(parts) >= 3 and parts[0] == "GESTER-SYNC":
+        return parts[1], parts[2], (parts[3] if len(parts) == 4 else "")
+    return None
+
+
 # ---------- THE DISCORD BOT ----------
 try:
     import discord
@@ -140,12 +187,18 @@ class DiscordLink:
     def __init__(self):
         self.ready = False
         self.problem = None      # a message explaining what's wrong, if anything
+        self.inbox = deque()     # things that arrived from Discord, waiting for the window
+        self.client_id = "%06x" % random.randrange(16 ** 6)   # lets us ignore our own echoes
+        self.loaded = False
         if discord is None:
             self.problem = "discord.py not found by this Python (see terminal)"
             return
         config_path = find_file("config.json")
         if config_path is None:
-            self.problem = "config.json not found next to Gester.exe"
+            if os.path.exists(os.path.join(HERE, "config.json.txt")):
+                self.problem = "rename config.json.txt to config.json"
+            else:
+                self.problem = "no config.json in ..." + HERE[-40:]
             return
         try:
             with open(config_path) as f:
@@ -164,11 +217,23 @@ class DiscordLink:
     def run(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        self.client = discord.Client(intents=discord.Intents.default())
+        intents = discord.Intents.default()
+        intents.message_content = USE_MESSAGE_CONTENT_INTENT
+        self.client = discord.Client(intents=intents)
 
         @self.client.event
         async def on_ready():
             self.ready = True
+            if not self.loaded:
+                self.loaded = True
+                await self.load_history()
+
+        @self.client.event
+        async def on_message(message):
+            if message.channel.id == SYNC_CHANNEL_ID:
+                self.inbox.append(("sync", message.content))
+            elif message.channel.id == CHAT_CHANNEL_ID:
+                self.inbox.append(("chat", message.content))
 
         try:
             self.loop.run_until_complete(self.client.start(self.token))
@@ -176,14 +241,49 @@ class DiscordLink:
             self.ready = False
             self.problem = f"bot error: {error}"
 
-    def send(self, text):
-        """Send a message to the channel. Returns a 'future' we can check later."""
+    async def find_channel(self, channel_id):
+        return self.client.get_channel(channel_id) or await self.client.fetch_channel(channel_id)
+
+    async def load_history(self):
+        """Read what happened before we started (shared names + recent chat)."""
+        try:
+            if SYNC_CHANNEL_ID:
+                channel = await self.find_channel(SYNC_CHANNEL_ID)
+                found = [m.content async for m in channel.history(limit=500)]
+                self.inbox.append(("sync_history", found[::-1]))   # oldest first
+            if CHAT_CHANNEL_ID:
+                channel = await self.find_channel(CHAT_CHANNEL_ID)
+                found = [m.content async for m in channel.history(limit=40)]
+                self.inbox.append(("chat_history", found[::-1]))
+        except Exception as error:
+            self.inbox.append(("error", f"Discord history error: {error}"))
+
+    def send(self, text, channel_id=None):
+        """Send a message. Returns a 'future' we can check later."""
+        channel_id = channel_id or self.channel_id
+
         async def go():
-            channel = self.client.get_channel(self.channel_id)
-            if channel is None:
-                channel = await self.client.fetch_channel(self.channel_id)
-            await channel.send(text)
+            channel = await self.find_channel(channel_id)
+            # no_mentions: a name like @everyone must never ping anyone
+            await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
         return asyncio.run_coroutine_threadsafe(go(), self.loop)
+
+    def post(self, text, channel_id):
+        """Send without waiting. Returns False if it couldn't even be tried."""
+        if self.problem or not self.ready or not channel_id:
+            return False
+        self.send(text, channel_id).add_done_callback(self.report_failure)
+        return True
+
+    def report_failure(self, future):
+        if future.cancelled():
+            return
+        error = future.exception()
+        if error:
+            self.inbox.append(("error", f"Discord error: {error}"))
+
+    def post_sync(self, kind, name=""):
+        return self.post(f"GESTER-SYNC {self.client_id} {kind} {name}".strip(), SYNC_CHANNEL_ID)
 
 
 # ---------- A LITTLE JESTER ----------
@@ -272,6 +372,10 @@ class Gester:
         self.ripples = []   # expanding rings made by clicks
         self.frame = 0
         self.names = load_names()   # the Name Chooser list (saved between runs)
+        self.username = load_username()
+        self.chat_open = False
+        self.unread = 0
+        self.clear_armed = False
         self.spinning = False
         self.bot = DiscordLink()
 
@@ -288,6 +392,7 @@ class Gester:
         self.make_menu_page()
         self.make_names_page()
         self.refresh_names()
+        self.make_chat_panel()
 
         self.status = self.canvas.create_text(
             WIDTH / 2, 455, text="Welcome to Gester!",
@@ -369,39 +474,190 @@ class Gester:
     def refresh_names(self):
         c = self.canvas
         c.delete("chip")
+        state = "normal" if self.page == "names" else "hidden"
         for i, name in enumerate(self.names[:9]):
             item = c.create_text(70, 168 + i * 25, anchor="w", text=f"\u2022  {name[:22]}",
-                                 fill="white", font=("Helvetica", 13), tags=("names", "chip"))
+                                 fill="white", font=("Helvetica", 13), tags=("names", "chip"),
+                                 state=state)
             c.tag_bind(item, "<Button-1>", lambda e, n=i: self.remove_name(n))
             c.tag_bind(item, "<Enter>", lambda e: c.config(cursor="hand2"))
             c.tag_bind(item, "<Leave>", lambda e: c.config(cursor=""))
         if len(self.names) > 9:
             c.create_text(70, 168 + 9 * 25, anchor="w", text=f"...and {len(self.names) - 9} more",
-                          fill="#6a6a88", font=("Helvetica", 11), tags=("names", "chip"))
+                          fill="#6a6a88", font=("Helvetica", 11), tags=("names", "chip"),
+                          state=state)
 
     def add_name(self):
-        name = self.entry.get().strip()
-        if name:
-            self.names.append(name)
-            save_names(self.names)
-            self.entry.delete(0, "end")
-            self.refresh_names()
-            self.canvas.itemconfig(self.status, text=f"Added {name}")
+        name = " ".join(self.entry.get().split())[:30]
+        if not name:
+            return
+        if name.lower() in [n.lower() for n in self.names]:
+            self.canvas.itemconfig(self.status, text=f"{name} is already in the list")
+            return
+        self.names.append(name)
+        save_names(self.names)
+        self.entry.delete(0, "end")
+        self.refresh_names()
+        text = f"Added {name}"
+        if not self.bot.post_sync("ADD", name) and SYNC_CHANNEL_ID:
+            text += " (not shared: bot isn't connected)"
+        self.canvas.itemconfig(self.status, text=text)
 
     def remove_name(self, index):
         if not self.spinning and index < len(self.names):
             removed = self.names.pop(index)
             save_names(self.names)
+            self.bot.post_sync("REMOVE", removed)
             self.canvas.config(cursor="")
             self.refresh_names()
             self.canvas.itemconfig(self.status, text=f"Removed {removed}")
 
     def clear_names(self):
-        if not self.spinning:
-            self.names.clear()
+        if self.spinning:
+            return
+        if not self.clear_armed:   # ask twice, because this clears the list for EVERYONE
+            self.clear_armed = True
+            self.canvas.itemconfig(self.status, text="Click CLEAR ALL again to clear the list for EVERYONE")
+            self.root.after(3000, self.disarm_clear)
+            return
+        self.clear_armed = False
+        self.names.clear()
+        save_names(self.names)
+        self.refresh_names()
+        self.canvas.itemconfig(self.result_text, text="?")
+        self.bot.post_sync("CLEAR")
+
+    def disarm_clear(self):
+        self.clear_armed = False
+
+    # --- multiplayer: things from Discord arrive here (checked every tick) ---
+    def check_inbox(self):
+        before = list(self.names)
+        while self.bot.inbox:
+            kind, data = self.bot.inbox.popleft()
+            if kind == "sync_history":
+                self.merge_history(data)
+            elif kind == "sync":
+                event = parse_sync(data)
+                if event and event[0] != self.bot.client_id:   # skip our own echoes
+                    apply_event(self.names, event[1], event[2])
+            elif kind == "chat_history":
+                for content in data:
+                    self.show_chat(content, quiet=True)
+            elif kind == "chat":
+                self.show_chat(data)
+            elif kind == "error":
+                self.canvas.itemconfig(self.status, text=data[:90])
+        if self.names != before:
             save_names(self.names)
             self.refresh_names()
-            self.canvas.itemconfig(self.result_text, text="?")
+
+    def merge_history(self, events):
+        """Rebuild the shared list from the sync channel's history."""
+        shared = []
+        for content in events:
+            event = parse_sync(content)
+            if event:
+                apply_event(shared, event[1], event[2])
+        if not os.path.exists(SEEDED_FILE):
+            # First time online: share the names this person already had saved
+            sent_all = True
+            for name in self.names:
+                if name.lower() not in [n.lower() for n in shared]:
+                    shared.append(name)
+                    sent_all = self.bot.post_sync("ADD", name) and sent_all
+            if sent_all:
+                try:
+                    open(SEEDED_FILE, "w").close()
+                except OSError:
+                    pass
+        self.names = shared
+
+    # --- the CHAT panel (the window grows to the right when it's open) ---
+    def make_entry(self):
+        return tk.Entry(self.root, font=("Helvetica", 12), bg="#161622", fg="white",
+                        insertbackground="white", relief="flat")
+
+    def make_chat_panel(self):
+        c = self.canvas
+        x0, x1 = WIDTH + 10, WIDTH + CHAT_W - 10
+        c.create_rectangle(x0, 45, x1, 450, fill="#10101a", outline="#333344", width=2, tags="chat")
+        c.create_text(x0 + 15, 65, anchor="w", text="CHAT", fill="white", tags="chat",
+                      font=("Helvetica", 16, "bold"))
+        self.make_button("CHATMIN", "-", x1 - 45, 52, x1 - 10, 78, "chat", self.toggle_chat, size=14)
+        c.create_text(x0 + 15, 100, anchor="w", text="your name", fill="#6a6a88",
+                      font=("Helvetica", 10), tags="chat")
+        self.name_entry = self.make_entry()
+        self.name_entry.insert(0, self.username)
+        self.name_entry.bind("<Return>", lambda e: self.set_username())
+        c.create_window(x0 + 80, 88, anchor="nw", window=self.name_entry, width=125, height=24, tags="chat")
+        self.make_button("SETNAME", "SET", x1 - 55, 88, x1 - 10, 112, "chat", self.set_username, size=10)
+        self.chat_log = tk.Text(self.root, bg="#10101a", fg="white", font=("Helvetica", 11),
+                                wrap="word", relief="flat", highlightthickness=0, padx=6, pady=4,
+                                state="disabled", cursor="arrow")
+        c.create_window(x0 + 8, 122, anchor="nw", window=self.chat_log, width=264, height=250, tags="chat")
+        self.chat_entry = self.make_entry()
+        self.chat_entry.bind("<Return>", lambda e: self.send_chat())
+        c.create_window(x0 + 8, 384, anchor="nw", window=self.chat_entry, width=200, height=30, tags="chat")
+        self.make_button("SEND", "SEND", x1 - 62, 384, x1 - 8, 414, "chat", self.send_chat, size=10)
+        c.create_text((x0 + x1) / 2, 435, text="suggestions welcome!", fill="#6a6a88",
+                      font=("Helvetica", 10), tags="chat")
+        # the little tab on the side that opens and closes the chat
+        self.make_button("CHATICON", "CHAT", WIDTH - 80, 215, WIDTH - 8, 251, "chaticon",
+                         self.toggle_chat, size=10)
+        c.itemconfig("chat", state="hidden")
+
+    def toggle_chat(self):
+        self.chat_open = not self.chat_open
+        width = WIDTH + CHAT_W if self.chat_open else WIDTH
+        self.canvas.config(width=width)
+        self.root.geometry(f"{width}x{HEIGHT}")
+        self.canvas.itemconfig("chat", state="normal" if self.chat_open else "hidden")
+        if self.chat_open:
+            self.unread = 0
+            self.update_chat_icon()
+            self.chat_entry.focus_set()
+        self.clear_hover()
+
+    def update_chat_icon(self):
+        label = f"CHAT ({self.unread})" if self.unread else "CHAT"
+        self.canvas.itemconfig(self.buttons["CHATICON"]["text"], text=label)
+
+    def set_username(self):
+        name = self.name_entry.get().replace("*", "").strip()[:20] or "Guest"
+        self.username = name
+        self.name_entry.delete(0, "end")
+        self.name_entry.insert(0, name)
+        save_username(name)
+        self.canvas.itemconfig(self.status, text=f"You are now {name}")
+
+    def send_chat(self):
+        text = " ".join(self.chat_entry.get().split())[:300]
+        if not text:
+            return
+        if not CHAT_CHANNEL_ID:
+            self.canvas.itemconfig(self.status, text="Chat isn't set up yet (CHAT_CHANNEL_ID)")
+        elif self.bot.post(f"**{self.username}**: {text}", CHAT_CHANNEL_ID):
+            self.chat_entry.delete(0, "end")   # it appears when Discord sends it back to us
+        else:
+            self.canvas.itemconfig(self.status, text="Can't send: bot isn't connected")
+
+    def show_chat(self, content, quiet=False):
+        if not (content.startswith("**") and "**: " in content[2:]):
+            return
+        name, text = content[2:].split("**: ", 1)
+        hue = sum(ord(ch) for ch in name) % 36    # same name = same color for everyone
+        tag = f"hue{hue}"
+        log = self.chat_log
+        log.config(state="normal")
+        log.tag_config(tag, foreground=rainbow(hue / 36, 0.6, 1.0), font=("Helvetica", 11, "bold"))
+        log.insert("end", name + ": ", tag)
+        log.insert("end", text + "\n")
+        log.config(state="disabled")
+        log.see("end")
+        if not self.chat_open and not quiet:
+            self.unread += 1
+            self.update_chat_icon()
 
     # --- the SPIN animation ---
     def spin(self):
@@ -456,7 +712,7 @@ class Gester:
         else:
             text = self.canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=label,
                                            fill="white", font=("Helvetica", size, "bold"), tags=page)
-        self.buttons[key] = {"box": box, "action": action}
+        self.buttons[key] = {"box": box, "action": action, "text": text}
         for item in (box, text):
             self.bind_button(item, key)
 
@@ -566,6 +822,14 @@ class Gester:
             else:
                 self.canvas.itemconfig(b["box"], outline="#333344", fill="#161622")
 
+
+        # messages and name changes from Discord; a problem here must not stop the animation
+        try:
+            self.check_inbox()
+        except Exception as error:
+            print("inbox problem:", error)
+        self.canvas.itemconfig(self.buttons["CHATICON"]["text"],
+                               fill=rainbow(self.hue * 5) if self.unread else "white")
 
         # jesters wander around (faster in Party Mode)
         for jester in self.jesters:
