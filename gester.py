@@ -25,18 +25,21 @@ from collections import deque
 
 # ---------- SETTINGS (change these to experiment!) ----------
 WIDTH, HEIGHT = 720, 480
-BACKGROUND = "#0d0d14"
 NORMAL_SPEED = 0.004      # how fast the rainbow cycles
 PARTY_SPEED = 0.02        # rainbow speed in Party Mode
 NUM_PARTICLES = 40
 NUM_JESTERS = 6
 
+# AUTO-UPDATING SOUNDS: your GitHub repo as "yourname/gester" ("" = off).
+# Put your sound files in a folder called "sounds" in that repo.
+GITHUB_REPO = ""
+
 # MULTIPLAYER: paste your Discord channel IDs here (0 = that feature is off)
-SYNC_CHANNEL_ID = 1556072377530458174      # the channel that keeps everyone's name list in sync
-CHAT_CHANNEL_ID = 1556072398111903784      # the channel the chat box uses
+SYNC_CHANNEL_ID = 0      # the channel that keeps everyone's name list in sync
+CHAT_CHANNEL_ID = 0      # the channel the chat box uses
 USE_MESSAGE_CONTENT_INTENT = False   # only set True if the chat shows blank messages
 CHAT_W = 300             # how much wider the window gets when the chat is open
-VERSION = "1.1.0"          # change this each update so you can see it worked
+VERSION = "1.4.0"          # change this each update so you can see it worked
 
 HOVER_SOUND = "hover.wav"
 CLICK_SOUND = "click.wav"
@@ -54,13 +57,62 @@ else:
 BUNDLE = getattr(sys, "_MEIPASS", HERE)
 
 
+# Sounds downloaded from GitHub are kept here
+SYNC_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Gester", "sounds")
+
+
 def find_file(filename):
-    """Look next to the program first, then inside the bundled .exe."""
-    for folder in (HERE, BUNDLE):
+    """Look next to the program, then in the downloaded sounds, then inside the .exe."""
+    for folder in (HERE, SYNC_DIR, BUNDLE):
         path = os.path.join(folder, filename)
         if os.path.exists(path):
             return path
     return None
+
+def sync_sounds(updates):
+    """Download new or changed files from the repo's sounds/ folder (runs in the background)."""
+    if not GITHUB_REPO:
+        return
+    try:
+        import urllib.request
+
+        def fetch(url, accept):
+            request = urllib.request.Request(url, headers={"User-Agent": "Gester", "Accept": accept})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.read()
+
+        listing = json.loads(fetch(f"https://api.github.com/repos/{GITHUB_REPO}/contents/sounds",
+                                   "application/vnd.github+json"))
+        os.makedirs(SYNC_DIR, exist_ok=True)
+        index_path = os.path.join(SYNC_DIR, "index.json")   # remembers which version of each file we have
+        try:
+            with open(index_path) as f:
+                index = json.load(f)
+        except Exception:
+            index = {}
+        changed = 0
+        for entry in listing:
+            if entry.get("type") != "file":
+                continue
+            name = os.path.basename(entry["name"])
+            path = os.path.join(SYNC_DIR, name)
+            if index.get(name) == entry["sha"] and os.path.exists(path):
+                continue    # already have this exact version
+            data = fetch(entry["url"], "application/vnd.github.raw+json")
+            if len(data) != entry["size"]:
+                continue    # incomplete download: try again next time
+            with open(path + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(path + ".tmp", path)
+            index[name] = entry["sha"]
+            with open(index_path, "w") as f:
+                json.dump(index, f)
+            changed += 1
+        if changed:
+            updates.append(("sounds", changed))
+    except Exception:
+        pass    # offline, rate-limited, or no sounds folder yet: just keep what we have
+
 
 # ---------- SOUND (uses pygame so music + effects can play together) ----------
 try:
@@ -105,10 +157,73 @@ def stop_song():
         pygame.mixer.music.stop()
 
 
+# ---------- THEMES ----------
+# Every color in Gester comes from here. "palette" is what the animated colors
+# cycle through (None = the full rainbow). Add your own theme by copying one!
+THEMES = {
+    "RAINBOW": dict(
+        palette=None, swatches=["#ff4d4d", "#ffb84d", "#4dff88", "#4d9dff", "#c04dff"],
+        bg="#0d0d14", panel="#161622", panel_hi="#1e1e30", panel_dark="#10101a",
+        border="#333344", grid="#2a2a3a", sel="#2b2b44", same="#222240",
+        text="white", given="#e8e8ff", muted="#6a6a88", dim="#8888aa", faint="#444460"),
+    "EMII": dict(    # minion: yellow, blue and black
+        palette=["#ffd90f", "#3d8bff"], swatches=["#ffd90f", "#3d8bff"],
+        bg="#090b12", panel="#0f1a36", panel_hi="#18285a", panel_dark="#0a1124",
+        border="#2a4a9a", grid="#1b2d5c", sel="#27408a", same="#1a2d63",
+        text="#fff6c2", given="#fffbe0", muted="#7a8fc7", dim="#9db0e0", faint="#3a4a7a"),
+    "MILLANA": dict(    # orange and purple
+        palette=["#ff8a1f", "#a259ff"], swatches=["#ff8a1f", "#a259ff"],
+        bg="#0f0818", panel="#1c1030", panel_hi="#2a1848", panel_dark="#140a22",
+        border="#5a2f99", grid="#2d1a4d", sel="#3d2468", same="#2a1a47",
+        text="#fff1e0", given="#ffe3c4", muted="#9c7fc4", dim="#b79be0", faint="#4a3470"),
+    "FLUG": dict(    # green and white
+        palette=["#2ee66b", "#f4fff7"], swatches=["#2ee66b", "#f4fff7"],
+        bg="#06110b", panel="#0d2016", panel_hi="#143321", panel_dark="#09170f",
+        border="#1f6b3d", grid="#112a1b", sel="#1f4d30", same="#143a25",
+        text="#ffffff", given="#e9fff0", muted="#6fa386", dim="#8fc7a6", faint="#2f5a42"),
+}
+COLOR_KEYS = ["bg", "panel", "panel_hi", "panel_dark", "border", "grid", "sel",
+              "same", "text", "given", "muted", "dim", "faint"]
+THEME_FILE = os.path.join(HERE, "theme.json")
+
+
+def load_theme_name():
+    try:
+        with open(THEME_FILE) as f:
+            name = json.load(f)["theme"]
+        return name if name in THEMES else "RAINBOW"
+    except Exception:
+        return "RAINBOW"
+
+
+def save_theme(name):
+    try:
+        with open(THEME_FILE, "w") as f:
+            json.dump({"theme": name}, f)
+    except OSError:
+        pass
+
+
+THEME = dict(THEMES[load_theme_name()])   # the theme in use right now
+
+
+def hex_to_rgb(color):
+    return [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+
+
 def rainbow(hue, saturation=0.8, brightness=1.0):
-    """Turn a number (0 to 1) into a rainbow color like '#ff00aa'."""
-    r, g, b = colorsys.hsv_to_rgb(hue % 1.0, saturation, brightness)
-    return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+    """Turn a number into a color that cycles through the current theme."""
+    palette = THEME["palette"]
+    if palette is None:
+        r, g, b = colorsys.hsv_to_rgb(hue % 1.0, saturation, brightness)
+        return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+    position = (hue % 1.0) * len(palette)
+    i = int(position)
+    mix = min(1.0, max(0.0, (position - i - 0.25) * 2))   # hold each color, then blend quickly
+    first = hex_to_rgb(palette[i % len(palette)])
+    second = hex_to_rgb(palette[(i + 1) % len(palette)])
+    r, g, b = [min(255, int((first[k] + (second[k] - first[k]) * mix) * brightness)) for k in range(3)]
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 # ---------- SAVING NAMES ----------
@@ -170,6 +285,100 @@ def parse_sync(content):
     if len(parts) >= 3 and parts[0] == "GESTER-SYNC":
         return parts[1], parts[2], (parts[3] if len(parts) == 4 else "")
     return None
+
+
+# ---------- SUDOKU ENGINE ----------
+SU_CELL, SU_X, SU_Y = 38, 40, 68       # cell size and where the grid starts
+PROGRESS_FILE = os.path.join(HERE, "sudoku.json")
+
+
+def load_progress():
+    """How many levels this person has beaten (0 to 100)."""
+    try:
+        with open(PROGRESS_FILE) as f:
+            return max(0, min(100, int(json.load(f)["completed"])))
+    except Exception:
+        return 0
+
+
+def save_progress(completed):
+    try:
+        with open(PROGRESS_FILE, "w") as f:
+            json.dump({"completed": completed}, f)
+    except OSError:
+        pass
+
+
+def solve(grid, limit, rng=None):
+    """Count solutions (up to limit). Returns (count, first_solution)."""
+    cells = grid[:]
+    rows, cols, boxes = [0] * 9, [0] * 9, [0] * 9
+    for i, v in enumerate(cells):
+        if v:
+            bit = 1 << v
+            rows[i // 9] |= bit
+            cols[i % 9] |= bit
+            boxes[i // 27 * 3 + i % 9 // 3] |= bit
+    found = {"count": 0, "first": None}
+
+    def search():
+        best, best_mask, best_n = -1, 0, 10
+        for i in range(81):
+            if cells[i] == 0:
+                used = rows[i // 9] | cols[i % 9] | boxes[i // 27 * 3 + i % 9 // 3]
+                mask = ~used & 0x3FE
+                n = bin(mask).count("1")
+                if n < best_n:
+                    best, best_mask, best_n = i, mask, n
+                    if n <= 1:
+                        break
+        if best == -1:
+            found["count"] += 1
+            if found["first"] is None:
+                found["first"] = cells[:]
+            return
+        if best_n == 0:
+            return
+        r, c, b = best // 9, best % 9, best // 27 * 3 + best % 9 // 3
+        values = [v for v in range(1, 10) if best_mask >> v & 1]
+        if rng:
+            rng.shuffle(values)
+        for v in values:
+            bit = 1 << v
+            cells[best] = v
+            rows[r] |= bit
+            cols[c] |= bit
+            boxes[b] |= bit
+            search()
+            cells[best] = 0
+            rows[r] &= ~bit
+            cols[c] &= ~bit
+            boxes[b] &= ~bit
+            if found["count"] >= limit:
+                return
+
+    search()
+    return found["count"], found["first"]
+
+
+def make_puzzle(level):
+    """Make Sudoku level 1-100. The same level is the same puzzle for everyone."""
+    rng = random.Random(level * 7919)
+    solution = solve([0] * 81, 1, rng)[1]
+    puzzle = solution[:]
+    target = round(46 - 24 * (level - 1) / 99)   # fewer clues = harder
+    order = list(range(81))
+    rng.shuffle(order)
+    clues = 81
+    for i in order:
+        if clues <= target:
+            break
+        saved, puzzle[i] = puzzle[i], 0
+        if solve(puzzle, 2)[0] == 1:
+            clues -= 1
+        else:
+            puzzle[i] = saved
+    return puzzle, solution
 
 
 # ---------- THE DISCORD BOT ----------
@@ -360,7 +569,7 @@ class Gester:
         self.root.resizable(False, False)
 
         self.canvas = tk.Canvas(self.root, width=WIDTH, height=HEIGHT,
-                                bg=BACKGROUND, highlightthickness=0)
+                                bg=THEME["bg"], highlightthickness=0)
         self.canvas.pack()
 
         self.hue = 0.0
@@ -378,6 +587,17 @@ class Gester:
         self.clear_armed = False
         self.spinning = False
         self.bot = DiscordLink()
+        self.updates = deque()           # news from the background sound updater
+        self.su_done = load_progress()   # sudoku levels beaten
+        self.su_level = 1
+        self.su_started = False
+        self.su_won = False
+        self.su_selected = None
+        self.su_mistakes = 0
+        self.su_hints = 3
+        self.su_puzzle = [0] * 81
+        self.su_grid = [0] * 81
+        self.su_solution = [0] * 81
 
         self.hover_sound = load_sound(HOVER_SOUND, 0.5)
         self.click_sound = load_sound(CLICK_SOUND)
@@ -392,6 +612,8 @@ class Gester:
         self.make_menu_page()
         self.make_names_page()
         self.refresh_names()
+        self.make_sudoku_page()
+        self.make_themes_page()
         self.make_chat_panel()
 
         self.status = self.canvas.create_text(
@@ -401,8 +623,14 @@ class Gester:
         self.canvas.create_text(WIDTH - 10, HEIGHT - 8, anchor="se", text=f"v{VERSION}",
                                 fill="#444460", font=("Helvetica", 9))
 
+        threading.Thread(target=sync_sounds, args=(self.updates,), daemon=True).start()
+        self.theme_name = load_theme_name()
+        self.apply_theme(THEMES["RAINBOW"], THEME)   # items are built in rainbow colors first
+        self.update_theme_labels()
+
         self.show_page("home")
         self.root.protocol("WM_DELETE_WINDOW", self.quit_app)
+        self.root.bind("<Key>", self.on_key)
         self.tick()  # start the animation loop
 
     # --- background pieces ---
@@ -445,8 +673,8 @@ class Gester:
         self.options_title = self.canvas.create_text(
             WIDTH / 2, 60, text="CHOOSE A TOOL", tags="menu", font=("Helvetica", 40, "bold"))
         tools = [("NAME CHOOSER", lambda: self.show_page("names")),
-                 ("TEAM SPLITTER (soon)", self.coming_soon),
-                 ("GAME NIGHT PING (soon)", self.coming_soon)]
+                 ("SUDOKU", self.open_sudoku),
+                 ("THEMES", lambda: self.show_page("themes"))]
         for i, (label, action) in enumerate(tools):
             y1 = 130 + i * 70
             self.make_button(label, label, 210, y1, 510, y1 + 52, "menu", action)
@@ -477,14 +705,14 @@ class Gester:
         state = "normal" if self.page == "names" else "hidden"
         for i, name in enumerate(self.names[:9]):
             item = c.create_text(70, 168 + i * 25, anchor="w", text=f"\u2022  {name[:22]}",
-                                 fill="white", font=("Helvetica", 13), tags=("names", "chip"),
+                                 fill=THEME["text"], font=("Helvetica", 13), tags=("names", "chip"),
                                  state=state)
             c.tag_bind(item, "<Button-1>", lambda e, n=i: self.remove_name(n))
             c.tag_bind(item, "<Enter>", lambda e: c.config(cursor="hand2"))
             c.tag_bind(item, "<Leave>", lambda e: c.config(cursor=""))
         if len(self.names) > 9:
             c.create_text(70, 168 + 9 * 25, anchor="w", text=f"...and {len(self.names) - 9} more",
-                          fill="#6a6a88", font=("Helvetica", 11), tags=("names", "chip"),
+                          fill=THEME["muted"], font=("Helvetica", 11), tags=("names", "chip"),
                           state=state)
 
     def add_name(self):
@@ -532,6 +760,13 @@ class Gester:
 
     # --- multiplayer: things from Discord arrive here (checked every tick) ---
     def check_inbox(self):
+        while self.updates:      # the sound updater finished downloading something
+            kind, count = self.updates.popleft()
+            if kind == "sounds":
+                self.hover_sound = load_sound(HOVER_SOUND, 0.5)
+                self.click_sound = load_sound(CLICK_SOUND)
+                self.jester_sound = load_sound(JESTER_SOUND)
+                self.canvas.itemconfig(self.status, text=f"Updated {count} sound file(s)!")
         before = list(self.names)
         while self.bot.inbox:
             kind, data = self.bot.inbox.popleft()
@@ -617,6 +852,8 @@ class Gester:
             self.unread = 0
             self.update_chat_icon()
             self.chat_entry.focus_set()
+        else:
+            self.canvas.focus_set()
         self.clear_hover()
 
     def update_chat_icon(self):
@@ -658,6 +895,242 @@ class Gester:
         if not self.chat_open and not quiet:
             self.unread += 1
             self.update_chat_icon()
+
+    # --- the THEMES page ---
+    def make_themes_page(self):
+        c = self.canvas
+        self.themes_title = c.create_text(WIDTH / 2, 55, text="THEMES", tags="themes",
+                                          font=("Helvetica", 40, "bold"))
+        for i, name in enumerate(THEMES):
+            y1 = 115 + i * 62
+            key = f"THEME_{name}"
+            self.make_button(key, name, 190, y1, 530, y1 + 52, "themes",
+                             lambda n=name: self.set_theme(n))
+            colors = THEMES[name]["swatches"]
+            for j, color in enumerate(colors):    # little color samples on the button
+                x2 = 516 - (len(colors) - 1 - j) * 26
+                swatch = c.create_rectangle(x2 - 20, y1 + 16, x2, y1 + 36, fill=color, outline="",
+                                            tags="themes")
+                self.bind_button(swatch, key)
+        self.make_button("THEMES_BACK", "BACK", 260, 385, 460, 430, "themes",
+                         lambda: self.show_page("menu"), size=14)
+
+    def update_theme_labels(self):
+        for name in THEMES:
+            label = f"{name}   (active)" if name == self.theme_name else name
+            self.canvas.itemconfig(self.buttons[f"THEME_{name}"]["text"], text=label)
+
+    def set_theme(self, name):
+        old = dict(THEME)
+        THEME.clear()
+        THEME.update(THEMES[name])
+        self.theme_name = name
+        self.apply_theme(old, THEMES[name])
+        save_theme(name)
+        self.update_theme_labels()
+        self.su_refresh()
+        self.canvas.itemconfig(self.status, text=f"Theme: {name}")
+
+    def apply_theme(self, old, new):
+        """Swap every themed color on screen from the old theme to the new one."""
+        if old is new or all(old[k] == new[k] for k in COLOR_KEYS):
+            return
+        swap = {old[k]: new[k] for k in COLOR_KEYS}
+        c = self.canvas
+        c.config(bg=new["bg"])
+        for item in c.find_all():
+            for option in ("fill", "outline"):
+                try:
+                    value = c.itemcget(item, option)
+                except tk.TclError:
+                    continue
+                if value in swap:
+                    c.itemconfig(item, **{option: swap[value]})
+        for entry in (self.entry, self.name_entry, self.chat_entry):
+            entry.config(bg=new["panel"], fg=new["text"], insertbackground=new["text"])
+        self.chat_log.config(bg=new["panel_dark"], fg=new["text"])
+        for tag in self.chat_log.tag_names():
+            if tag.startswith("hue"):
+                self.chat_log.tag_config(tag, foreground=rainbow(int(tag[3:]) / 36, 0.6, 1.0))
+
+    # --- the SUDOKU page ---
+    def make_sudoku_page(self):
+        c = self.canvas
+        self.su_title = c.create_text(SU_X, 38, anchor="w", text="SUDOKU", tags="sudoku",
+                                      font=("Helvetica", 26, "bold"))
+        self.su_cells, self.su_texts = [], []
+        for i in range(81):
+            row, col = divmod(i, 9)
+            x, y = SU_X + col * SU_CELL, SU_Y + row * SU_CELL
+            rect = c.create_rectangle(x, y, x + SU_CELL, y + SU_CELL, fill="#161622",
+                                      outline="#2a2a3a", tags="sudoku")
+            text = c.create_text(x + SU_CELL / 2, y + SU_CELL / 2, fill="white",
+                                 font=("Helvetica", 17, "bold"), tags="sudoku")
+            for item in (rect, text):
+                c.tag_bind(item, "<Button-1>", lambda e, n=i: self.su_select(n))
+            self.su_cells.append(rect)
+            self.su_texts.append(text)
+        size = 9 * SU_CELL
+        self.su_lines = []     # the thick lines between the 3x3 boxes
+        for k in range(4):
+            offset = k * 3 * SU_CELL
+            self.su_lines.append(c.create_line(SU_X + offset, SU_Y, SU_X + offset, SU_Y + size,
+                                               width=3, tags="sudoku"))
+            self.su_lines.append(c.create_line(SU_X, SU_Y + offset, SU_X + size, SU_Y + offset,
+                                               width=3, tags="sudoku"))
+        cx = 535
+        self.su_level_text = c.create_text(cx, 82, fill="white", font=("Helvetica", 18, "bold"), tags="sudoku")
+        self.su_info = c.create_text(cx, 106, fill="#8888aa", font=("Helvetica", 10), tags="sudoku")
+        self.su_unlocked_text = c.create_text(cx, 138, fill="#6a6a88", font=("Helvetica", 10), tags="sudoku")
+        self.make_button("SU_PREV", "<", 420, 122, 470, 154, "sudoku", lambda: self.su_go(-1), size=14)
+        self.make_button("SU_NEXT", ">", 600, 122, 650, 154, "sudoku", lambda: self.su_go(1), size=14)
+        for d in range(1, 10):
+            row, col = divmod(d - 1, 3)
+            x1, y1 = 435 + col * 58, 172 + row * 58
+            self.make_button(f"SU_N{d}", str(d), x1, y1, x1 + 50, y1 + 50, "sudoku",
+                             lambda n=d: self.su_place(n), size=18)
+        self.make_button("SU_HINT", "HINT (3)", 435, 352, 601, 386, "sudoku", self.su_hint, size=12)
+        self.make_button("SU_BACK", "BACK", 435, 396, 601, 430, "sudoku",
+                         lambda: self.show_page("menu"), size=12)
+
+    def open_sudoku(self):
+        self.show_page("sudoku")
+        if not self.su_started or self.su_won:   # otherwise carry on where you left off
+            self.su_load_level(min(self.su_done + 1, 100))
+        self.canvas.itemconfig(self.status, text="Click a square, then press a number (or use the pad)")
+
+    def su_load_level(self, level):
+        self.su_level = level
+        self.su_puzzle, self.su_solution = make_puzzle(level)
+        self.su_grid = self.su_puzzle[:]
+        self.su_started = True
+        self.su_won = False
+        self.su_selected = None
+        self.su_mistakes = 0
+        self.su_hints = 3
+        self.su_refresh()
+
+    def su_go(self, step):
+        target = self.su_level + step
+        if target < 1 or target > 100:
+            return
+        if target > min(self.su_done + 1, 100):
+            self.canvas.itemconfig(self.status, text=f"Beat level {self.su_level} first!")
+            return
+        self.su_load_level(target)
+
+    def su_select(self, index):
+        self.su_selected = index
+        self.canvas.focus_set()
+        self.su_refresh()
+
+    def su_refresh(self):
+        c = self.canvas
+        sel = self.su_selected
+        sel_value = self.su_grid[sel] if sel is not None else 0
+        for i in range(81):
+            value = self.su_grid[i]
+            if i == sel:
+                fill = THEME["sel"]
+            elif sel_value and value == sel_value:
+                fill = THEME["same"]     # same number as the selected square
+            else:
+                fill = THEME["panel"]
+            c.itemconfig(self.su_cells[i], fill=fill, outline=THEME["grid"], width=1)
+            color = THEME["given"] if self.su_puzzle[i] else rainbow(value / 9, 0.7, 1.0)
+            c.itemconfig(self.su_texts[i], text=str(value) if value else "", fill=color)
+        self.su_update_info()
+
+    def su_update_info(self):
+        c = self.canvas
+        clues = sum(1 for v in self.su_puzzle if v)
+        c.itemconfig(self.su_level_text, text=f"LEVEL {self.su_level} / 100")
+        c.itemconfig(self.su_info, text=f"clues {clues}   mistakes {self.su_mistakes}   hints {self.su_hints}")
+        c.itemconfig(self.su_unlocked_text, text=f"unlocked: {min(self.su_done + 1, 100)}")
+        c.itemconfig(self.buttons["SU_HINT"]["text"], text=f"HINT ({self.su_hints})")
+
+    def su_place(self, digit):
+        i = self.su_selected
+        if self.su_won or i is None or self.su_grid[i] != 0:
+            return
+        if digit == self.su_solution[i]:
+            self.su_grid[i] = digit
+            play(self.click_sound)
+            self.su_refresh()
+            self.su_check_win()
+        else:   # wrong: flash red, count the mistake, don't place it
+            self.su_mistakes += 1
+            play(self.hover_sound)
+            self.canvas.itemconfig(self.su_texts[i], text=str(digit), fill="#ff4d4d")
+            self.canvas.itemconfig(self.su_cells[i], fill="#4a1a1a")
+            self.su_update_info()
+            self.root.after(450, self.su_refresh)
+
+    def su_hint(self):
+        if self.su_won:
+            return
+        if self.su_hints <= 0:
+            self.canvas.itemconfig(self.status, text="No hints left on this level")
+            return
+        i = self.su_selected
+        if i is None or self.su_grid[i] != 0:
+            empty = [n for n in range(81) if self.su_grid[n] == 0]
+            if not empty:
+                return
+            i = random.choice(empty)
+        self.su_hints -= 1
+        self.su_grid[i] = self.su_solution[i]
+        self.su_selected = i
+        self.su_refresh()
+        self.su_check_win()
+
+    def su_check_win(self):
+        if self.su_grid != self.su_solution:
+            return
+        self.su_won = True
+        level = self.su_level
+        if level > self.su_done:
+            self.su_done = level
+            save_progress(level)
+        play(self.jester_sound)
+        for _ in range(10 if level < 100 else 25):
+            self.ripples.append([random.randint(SU_X, SU_X + 9 * SU_CELL),
+                                 random.randint(SU_Y, SU_Y + 9 * SU_CELL), 5])
+        if level == 100:
+            text = "YOU BEAT ALL 100 LEVELS!!!"
+        else:
+            text = f"Level {level} complete! Loading level {level + 1}..."
+        self.canvas.itemconfig(self.status, text=text)
+        self.su_update_info()
+        if level % 10 == 0:   # tell the server about milestones
+            self.bot.post(f"\U0001F9E9 **{self.username}** just beat Sudoku level {level}!",
+                          getattr(self.bot, "channel_id", 0))
+        if level < 100:
+            self.root.after(2500, lambda: self.su_advance(level))
+
+    def su_advance(self, level):
+        if self.page == "sudoku" and self.su_level == level and self.su_won:
+            self.su_load_level(level + 1)
+
+    def on_key(self, event):
+        if self.page != "sudoku":
+            return
+        try:
+            if isinstance(self.root.focus_get(), (tk.Entry, tk.Text)):
+                return   # they're typing in the chat
+        except KeyError:
+            pass
+        if event.char and event.char in "123456789":
+            self.su_place(int(event.char))
+        elif event.keysym in ("Up", "Down", "Left", "Right"):
+            if self.su_selected is None:
+                self.su_selected = 40
+            else:
+                row, col = divmod(self.su_selected, 9)
+                row += {"Up": -1, "Down": 1}.get(event.keysym, 0)
+                col += {"Left": -1, "Right": 1}.get(event.keysym, 0)
+                self.su_selected = (row % 9) * 9 + col % 9
+            self.su_refresh()
 
     # --- the SPIN animation ---
     def spin(self):
@@ -724,11 +1197,13 @@ class Gester:
     def show_page(self, name):
         """Show one page and hide the other."""
         self.page = name
-        for page in ("home", "menu", "names"):
+        for page in ("home", "menu", "names", "sudoku", "themes"):
             self.canvas.itemconfig(page, state="normal" if page == name else "hidden")
         self.clear_hover()
         if name == "names":
             self.entry.focus_set()
+        else:
+            self.canvas.focus_set()   # so the keyboard works for sudoku
 
     # --- reacting to the mouse ---
     def on_hover(self, key):
@@ -813,15 +1288,28 @@ class Gester:
             self.canvas.coords(letter, x, 110 + bob)
         self.canvas.itemconfig(self.options_title, fill=rainbow(self.hue * 2))
         self.canvas.itemconfig(self.names_title, fill=rainbow(self.hue * 2))
+        self.canvas.itemconfig(self.themes_title, fill=rainbow(self.hue * 2))
         self.canvas.itemconfig(self.result_text, fill=rainbow(self.hue * 4))
 
         # buttons glow with the rainbow when hovered
         for key, b in self.buttons.items():
             if key == self.hovered:
-                self.canvas.itemconfig(b["box"], outline=rainbow(self.hue * 3), fill="#1e1e30")
+                self.canvas.itemconfig(b["box"], outline=rainbow(self.hue * 3), fill=THEME["panel_hi"])
             else:
-                self.canvas.itemconfig(b["box"], outline="#333344", fill="#161622")
+                self.canvas.itemconfig(b["box"], outline=THEME["border"], fill=THEME["panel"])
 
+
+        # sudoku page: rainbow title and lines, glowing selected square, victory rainbow
+        if self.page == "sudoku":
+            self.canvas.itemconfig(self.su_title, fill=rainbow(self.hue * 2))
+            for line in self.su_lines:
+                self.canvas.itemconfig(line, fill=rainbow(self.hue * 3))
+            if self.su_selected is not None and not self.su_won:
+                self.canvas.itemconfig(self.su_cells[self.su_selected],
+                                       outline=rainbow(self.hue * 3), width=3)
+            if self.su_won:
+                for i, text in enumerate(self.su_texts):
+                    self.canvas.itemconfig(text, fill=rainbow(self.hue * 4 + i * 0.012, 0.7, 1.0))
 
         # messages and name changes from Discord; a problem here must not stop the animation
         try:
@@ -829,7 +1317,7 @@ class Gester:
         except Exception as error:
             print("inbox problem:", error)
         self.canvas.itemconfig(self.buttons["CHATICON"]["text"],
-                               fill=rainbow(self.hue * 5) if self.unread else "white")
+                               fill=rainbow(self.hue * 5) if self.unread else THEME["text"])
 
         # jesters wander around (faster in Party Mode)
         for jester in self.jesters:
