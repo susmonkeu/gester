@@ -35,11 +35,11 @@ NUM_JESTERS = 6
 GITHUB_REPO = ""
 
 # MULTIPLAYER: paste your Discord channel IDs here (0 = that feature is off)
-SYNC_CHANNEL_ID = 0      # the channel that keeps everyone's name list in sync
-CHAT_CHANNEL_ID = 0      # the channel the chat box uses
+SYNC_CHANNEL_ID = 1556072377530458174      # the channel that keeps everyone's name list in sync
+CHAT_CHANNEL_ID = 1556072398111903784      # the channel the chat box uses
 USE_MESSAGE_CONTENT_INTENT = False   # only set True if the chat shows blank messages
 CHAT_W = 300             # how much wider the window gets when the chat is open
-VERSION = "1.4.0"          # change this each update so you can see it worked
+VERSION = "1.4.1"          # change this each update so you can see it worked
 
 HOVER_SOUND = "hover.wav"
 CLICK_SOUND = "click.wav"
@@ -673,7 +673,7 @@ class Gester:
         self.options_title = self.canvas.create_text(
             WIDTH / 2, 60, text="CHOOSE A TOOL", tags="menu", font=("Helvetica", 40, "bold"))
         tools = [("NAME CHOOSER", lambda: self.show_page("names")),
-                 ("SUDOKU", self.open_sudoku),
+                 ("MILLOKU", self.open_sudoku),
                  ("THEMES", lambda: self.show_page("themes"))]
         for i, (label, action) in enumerate(tools):
             y1 = 130 + i * 70
@@ -956,7 +956,7 @@ class Gester:
     # --- the SUDOKU page ---
     def make_sudoku_page(self):
         c = self.canvas
-        self.su_title = c.create_text(SU_X, 38, anchor="w", text="SUDOKU", tags="sudoku",
+        self.su_title = c.create_text(SU_X, 38, anchor="w", text="MILLOKU", tags="sudoku",
                                       font=("Helvetica", 26, "bold"))
         self.su_cells, self.su_texts = [], []
         for i in range(81):
@@ -1103,7 +1103,7 @@ class Gester:
         self.canvas.itemconfig(self.status, text=text)
         self.su_update_info()
         if level % 10 == 0:   # tell the server about milestones
-            self.bot.post(f"\U0001F9E9 **{self.username}** just beat Sudoku level {level}!",
+            self.bot.post(f"\U0001F9E9 **{self.username}** just beat Milloku level {level}!",
                           getattr(self.bot, "channel_id", 0))
         if level < 100:
             self.root.after(2500, lambda: self.su_advance(level))
