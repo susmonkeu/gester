@@ -55,7 +55,7 @@ CHAT_CHANNEL_ID = 1556072398111903784      # the channel the chat box uses
 BOARD_CHANNEL_ID = 1556556283266469928     # the channel the Milloku leaderboard uses
 USE_MESSAGE_CONTENT_INTENT = False   # only set True if the chat shows blank messages
 CHAT_W = 300             # how much wider the window gets when the chat is open
-VERSION = "1.9.0"          # change this each update so you can see it worked
+VERSION = "1.9.1"          # change this each update so you can see it worked
 
 HOVER_SOUND = "hover.wav"
 CLICK_SOUND = "click.wav"
@@ -830,6 +830,11 @@ class DiscordLink:
         return self.post(f"GESTER-SYNC {self.client_id} {kind} {name}".strip(), SYNC_CHANNEL_ID)
 
 
+# The part of the canvas you can currently see (it changes when the window is resized).
+VIEW = {"x0": 0.0, "y0": 0.0, "x1": float(WIDTH), "y1": float(HEIGHT)}
+BAR_W, BAR_PAD = 12, 1800     # the rainbow bar is built from 12px pieces that reach far past the window
+
+
 # ---------- THE BACKGROUND CHARACTERS (jesters, minions, cats, aliens) ----------
 CRITTER_SAYS = {"jester": "Hee hee! You poked a jester!", "minion": "Bello! You poked a minion!",
                 "cat": "Meow! You poked a cat!", "alien": "Greetings, human! You poked an alien!"}
@@ -953,9 +958,9 @@ class Jester:
         self.y += dy
 
         # bounce off the edges
-        if (self.x < 25 and self.dx < 0) or (self.x > WIDTH - 25 and self.dx > 0):
+        if (self.x < VIEW["x0"] + 25 and self.dx < 0) or (self.x > VIEW["x1"] - 25 and self.dx > 0):
             self.dx *= -1
-        if (self.y < 40 and self.dy < 0) or (self.y > HEIGHT - 45 and self.dy > 0):
+        if (self.y < VIEW["y0"] + 40 and self.dy < 0) or (self.y > VIEW["y1"] - 45 and self.dy > 0):
             self.dy *= -1
 
         for part in self.parts:
@@ -1024,11 +1029,15 @@ class Gester:
             except Exception:
                 pass
         self.root.geometry(f"{WIDTH}x{HEIGHT}")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
+        self.root.minsize(WIDTH, HEIGHT)      # you can make it bigger, but not smaller than this
+        self.chat_frac = 0.0                  # 0 = chat closed, 1 = chat fully open (animates between)
+        self.chat_extra = 0                   # how many pixels the chat widened the window
 
         self.canvas = tk.Canvas(self.root, width=WIDTH, height=HEIGHT,
                                 bg=THEME["bg"], highlightthickness=0)
-        self.canvas.pack()
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", self.on_resize)
 
         self.hue = 0.0
         self.speed = NORMAL_SPEED
@@ -1149,7 +1158,6 @@ class Gester:
     def toggle_mute(self):
         self.muted = not self.muted
         save_muted(self.muted)
-        self.buttons["MUTE"]["text"].set_text("MUTED" if self.muted else "MUSIC")
         self.canvas.itemconfig(self.status, text="Music muted" if self.muted else "Music on")
 
     # --- the intro: the bar sweeps in, GESTER drops and bounces, the buttons pop up ---
@@ -1167,8 +1175,9 @@ class Gester:
         if f == 0:
             play(self.intro_sound)
         shown = min(1.0, f / 28)                      # the rainbow bar sweeps in from the left
-        for i, rect in enumerate(self.bar):
-            c.itemconfig(rect, state="normal" if i / len(self.bar) <= shown else "hidden")
+        reach = VIEW["x0"] + shown * (VIEW["x1"] - VIEW["x0"])
+        for rect, x in zip(self.bar, self.bar_x):
+            c.itemconfig(rect, state="normal" if x <= reach else "hidden")
         for i in range(len(self.letters)):            # each letter thumps down
             if f == i * 5 + 24:
                 play(self.hover_sound)
@@ -1222,7 +1231,8 @@ class Gester:
         if t >= cover_done and not tr["applied"]:
             tr["applied"] = True
             self._apply_page(tr["page"])             # swap pages while the screen is covered
-        width = WIDTH / n
+        vx0, vy0, vx1, vy1 = VIEW["x0"], VIEW["y0"], VIEW["x1"], VIEW["y1"]
+        vh, width = vy1 - vy0, (vx1 - vx0) / n
         for i, bar in enumerate(self.wipe_bars):
             order = i if tr["forward"] else n - 1 - i
             covering = t <= cover_done
@@ -1231,13 +1241,13 @@ class Gester:
             ease = p * p * (3 - 2 * p)
             from_top = i % 2 == 0                    # every other bar comes from the bottom
             if covering:
-                y1, y2 = (0, HEIGHT * ease) if from_top else (HEIGHT * (1 - ease), HEIGHT)
+                ya, yb = (vy0, vy0 + vh * ease) if from_top else (vy0 + vh * (1 - ease), vy1)
                 visible = p > 0
             else:
-                y1, y2 = (HEIGHT * ease, HEIGHT) if from_top else (0, HEIGHT * (1 - ease))
+                ya, yb = (vy0 + vh * ease, vy1) if from_top else (vy0, vy0 + vh * (1 - ease))
                 visible = p < 1
             if visible:
-                c.coords(bar, i * width, y1, (i + 1) * width + 1, y2)
+                c.coords(bar, vx0 + i * width, ya, vx0 + (i + 1) * width + 1, yb)
                 c.itemconfig(bar, state="normal", fill=mix(THEME["bg"], rainbow(self.hue * 2 + i * 0.1), 0.75),
                              outline=rainbow(self.hue * 3 + i * 0.1))
             else:
@@ -1249,23 +1259,62 @@ class Gester:
         a = self.chat_anim
         a["t"] += 1
         p = min(1.0, a["t"] / 12)
-        width = int(a["from"] + (a["to"] - a["from"]) * (1 - (1 - p) ** 3))
-        self.canvas.config(width=width)
-        self.root.geometry(f"{width}x{HEIGHT}")
+        e = 1 - (1 - p) ** 3
+        self.chat_frac = a["from"] + (a["to"] - a["from"]) * e
+        cw = self.canvas.winfo_width()
+        if a["dw"]:                                  # the window only widens/narrows if it needs to
+            cw = int(a["w0"] + a["dw"] * e)
+            self.chat_extra = int(a["extra0"] + a["dw"] * e)
+            self.root.geometry(f"{cw}x{self.root.winfo_height()}")
+        self.layout(cw, self.canvas.winfo_height())
         if p >= 1.0:
             self.chat_anim = None
-            if not self.chat_open:
+            self.chat_frac = a["to"]
+            self.layout()
+            if self.chat_open:
+                self.root.minsize(WIDTH + CHAT_W, HEIGHT)
+            else:
                 self.canvas.itemconfig("chat", state="hidden")
 
+    # --- resizing: the pages stay centered, the background fills the whole window ---
+    def on_resize(self, event=None):
+        self.layout(event.width if event else None, event.height if event else None)
+
+    def layout(self, cw=None, ch=None):
+        c = self.canvas
+        cw, ch = cw or c.winfo_width(), ch or c.winfo_height()
+        if cw < 100 or ch < 100 or not hasattr(self, "bar"):
+            return
+        content = WIDTH + CHAT_W * self.chat_frac          # the pages, plus the chat panel as it opens
+        ox = int(max(0, (cw - content) / 2))
+        oy = int(max(0, (ch - HEIGHT) / 2))
+        c.config(scrollregion=(-ox, -oy, -ox + cw, -oy + ch))
+        c.xview_moveto(0)
+        c.yview_moveto(0)
+        VIEW.update(x0=float(-ox), y0=float(-oy), x1=float(-ox + cw), y1=float(-oy + ch))
+        if self.bar_top != VIEW["y0"]:                      # keep the rainbow bar on the very top edge
+            self.bar_top = VIEW["y0"]
+            for rect, x in zip(self.bar, self.bar_x):
+                c.coords(rect, x, self.bar_top, x + BAR_W, self.bar_top + 10)
+        want = min(220, int(NUM_PARTICLES * (cw * ch) / (WIDTH * HEIGHT)))   # more dots in a bigger window
+        want = max(want, NUM_PARTICLES)
+        while len(self.particles) < want:
+            self.add_particle(random.uniform(VIEW["x0"], VIEW["x1"]), random.uniform(VIEW["y0"], VIEW["y1"]))
+        while len(self.particles) > want:                   # smaller window again: drop the extras
+            c.delete(self.particles.pop()["id"])
+
     # --- background pieces ---
+    def add_particle(self, x, y):
+        size = random.randint(2, 5)
+        dot = self.canvas.create_oval(x, y, x + size, y + size, outline="")
+        if self.particles:                  # keep it with the other dots, behind the pages
+            self.canvas.tag_raise(dot, self.particles[-1]["id"])
+        self.particles.append({"id": dot, "x": x, "y": y, "size": size, "speed": random.uniform(0.3, 1.5)})
+
     def make_particles(self):
         self.particles = []
         for _ in range(NUM_PARTICLES):
-            x, y = random.randint(0, WIDTH), random.randint(0, HEIGHT)
-            size = random.randint(2, 5)
-            dot = self.canvas.create_oval(x, y, x + size, y + size, outline="")
-            self.particles.append({"id": dot, "x": x, "y": y, "size": size,
-                                   "speed": random.uniform(0.3, 1.5)})
+            self.add_particle(random.randint(0, WIDTH), random.randint(0, HEIGHT))
 
     def make_jesters(self):
         above = self.particles[-1]["id"] if self.particles else None
@@ -1275,8 +1324,11 @@ class Gester:
                         for _ in range(NUM_JESTERS)]
 
     def make_bar(self):
-        self.bar = [self.canvas.create_rectangle(i * 12, 0, i * 12 + 12, 10, outline="")
-                    for i in range(WIDTH // 12 + 1)]
+        count = (WIDTH + CHAT_W + 2 * BAR_PAD) // BAR_W + 1
+        self.bar_x = [-BAR_PAD + i * BAR_W for i in range(count)]
+        self.bar_top = VIEW["y0"]
+        self.bar = [self.canvas.create_rectangle(x, self.bar_top, x + BAR_W, self.bar_top + 10, outline="")
+                    for x in self.bar_x]
 
     # --- the HOME page ---
     def make_home_page(self):
@@ -1449,12 +1501,13 @@ class Gester:
     # --- the CHAT panel (the window grows to the right when it's open) ---
     def make_entry(self):
         return tk.Entry(self.root, font=("Helvetica", 12), bg="#161622", fg="white",
-                        insertbackground="white", relief="flat")
+                        insertbackground="white", relief="flat", highlightthickness=0)
 
     def make_chat_panel(self):
         c = self.canvas
         x0, x1 = WIDTH + 10, WIDTH + CHAT_W - 10
-        c.create_rectangle(x0, 45, x1, 450, fill="#10101a", outline="#333344", width=2, tags="chat")
+        self.chat_rect = c.create_polygon(rounded(x0, 45, x1, 450, 20), smooth=True, fill="#10101a",
+                                          outline="#333344", width=2, tags="chat")
         c.create_text(x0 + 15, 65, anchor="w", text="CHAT", fill="white", tags="chat",
                       font=("Helvetica", 16, "bold"))
         self.make_button("CHATMIN", "-", x1 - 45, 52, x1 - 10, 78, "chat", self.toggle_chat, size=14)
@@ -1465,7 +1518,9 @@ class Gester:
         self.name_entry = self.make_entry()
         self.name_entry.insert(0, self.username if self.my_fp in ROSTER else "(not approved)")
         self.name_entry.config(state="readonly", readonlybackground="#161622")   # names come from ROSTER
-        c.create_window(x0 + 80, 88, anchor="nw", window=self.name_entry, width=125, height=24, tags="chat")
+        c.create_polygon(rounded(x0 + 76, 86, x0 + 209, 114, 12), smooth=True, fill="#161622",
+                         outline="#333344", width=1, tags="chat")
+        c.create_window(x0 + 84, 90, anchor="nw", window=self.name_entry, width=117, height=20, tags="chat")
         self.make_button("COPYID", "ID", x1 - 55, 88, x1 - 10, 112, "chat", self.copy_id, size=10)
         self.chat_log = tk.Text(self.root, bg="#10101a", fg="white", font=("Helvetica", 11),
                                 wrap="word", relief="flat", highlightthickness=0, padx=6, pady=4,
@@ -1473,21 +1528,36 @@ class Gester:
         c.create_window(x0 + 8, 122, anchor="nw", window=self.chat_log, width=264, height=250, tags="chat")
         self.chat_entry = self.make_entry()
         self.chat_entry.bind("<Return>", lambda e: self.send_chat())
-        c.create_window(x0 + 8, 384, anchor="nw", window=self.chat_entry, width=200, height=30, tags="chat")
+        c.create_polygon(rounded(x0 + 8, 382, x0 + 212, 416, 14), smooth=True, fill="#161622",
+                         outline="#333344", width=1, tags="chat")
+        c.create_window(x0 + 18, 387, anchor="nw", window=self.chat_entry, width=184, height=24, tags="chat")
         self.make_button("SEND", "SEND", x1 - 62, 384, x1 - 8, 414, "chat", self.send_chat, size=10)
         c.create_text((x0 + x1) / 2, 435, text="suggestions welcome!", fill="#6a6a88",
                       font=("Helvetica", 10), tags="chat")
         # the little tab on the side that opens and closes the chat
         self.make_button("CHATICON", "CHAT", WIDTH - 80, 215, WIDTH - 8, 251, "chaticon",
                          self.toggle_chat, size=10)
-        self.make_button("MUTE", "MUTED" if self.muted else "MUSIC", 8, 448, 76, 474, "chaticon",
-                         self.toggle_mute, size=9)      # the music on/off button
+        self.make_button("MUTE", "", 10, 442, 48, 474, "chaticon", self.toggle_mute)   # music on/off
+        icon = {"body": c.create_polygon(0, 0, 0, 0, 0, 0, fill="", outline="", tags="chaticon"),
+                "wave1": c.create_arc(0, 0, 1, 1, start=-50, extent=100, style="arc", outline="", tags="chaticon"),
+                "wave2": c.create_arc(0, 0, 1, 1, start=-50, extent=100, style="arc", outline="", tags="chaticon"),
+                "x1": c.create_line(0, 0, 0, 0, fill="", capstyle="round", tags="chaticon"),
+                "x2": c.create_line(0, 0, 0, 0, fill="", capstyle="round", tags="chaticon")}
+        self.buttons["MUTE"]["icon"] = icon
+        for item in icon.values():
+            self.bind_button(item, "MUTE")
         c.itemconfig("chat", state="hidden")
 
     def toggle_chat(self):
         self.chat_open = not self.chat_open
-        start = int(float(self.canvas.cget("width")))
-        self.chat_anim = {"t": 0, "from": start, "to": WIDTH + CHAT_W if self.chat_open else WIDTH}
+        cw = self.canvas.winfo_width()
+        if self.chat_open:
+            dw = max(0, WIDTH + CHAT_W - cw)           # widen the window only if it is too narrow
+        else:
+            dw = -min(self.chat_extra, max(0, cw - WIDTH))
+            self.root.minsize(WIDTH, HEIGHT)           # let it shrink back
+        self.chat_anim = {"t": 0, "from": self.chat_frac, "to": 1.0 if self.chat_open else 0.0,
+                          "w0": cw, "dw": dw, "extra0": self.chat_extra}
         play(self.chat_open_sound if self.chat_open else self.chat_close_sound)
         if self.chat_open:
             self.canvas.itemconfig("chat", state="normal")     # it slides out as the window widens
@@ -1677,11 +1747,15 @@ class Gester:
             self.make_button(key, name, 190, y1, 530, y1 + 52, "themes",
                              lambda n=name: self.set_theme(n))
             colors = THEMES[name]["swatches"]
-            for j, color in enumerate(colors):    # little color samples on the button
-                x2 = 516 - (len(colors) - 1 - j) * 26
-                swatch = c.create_rectangle(x2 - 20, y1 + 16, x2, y1 + 36, fill=color, outline="",
-                                            tags="themes")
-                self.bind_button(swatch, key)
+            size, sx, sy = 30, 480, y1 + 11      # ONE small square, striped with all of the theme's colors
+            parts = [c.create_rectangle(sx + round(j * size / len(colors)), sy,
+                                        sx + round((j + 1) * size / len(colors)), sy + size,
+                                        fill=color, outline="", tags="themes")
+                     for j, color in enumerate(colors)]
+            parts.append(c.create_rectangle(sx, sy, sx + size, sy + size, fill="", outline="#d0d0e0",
+                                            width=2, tags="themes"))
+            for part in parts:
+                self.bind_button(part, key)
         self.make_button("THEMES_BACK", "BACK", 260, 385, 460, 430, "themes",
                          lambda: self.show_page("menu"), size=14)
 
@@ -1982,7 +2056,8 @@ class Gester:
             b["flash"] = b["flash"] * 0.82 if b["flash"] > 0.03 else 0.0
             b["scale"] += ((1.05 if hovered else 1.0) - b["scale"]) * 0.3
             scale = b["scale"] + b["kick"]
-            signature = (hovered, self.theme_name, self.unread if key == "CHATICON" else 0)
+            signature = (hovered, self.theme_name, self.unread if key == "CHATICON" else 0,
+                         self.muted if key == "MUTE" else 0)
             if hovered or b["flash"] or signature != b["sig"] or abs(scale - b["shown"]) > 0.002:
                 self.paint_button(key, b, hovered, scale)
                 b["sig"], b["shown"] = signature, scale
@@ -2032,6 +2107,35 @@ class Gester:
         else:
             face = THEME["text"]
         text.paint(face)
+        if b.get("icon"):
+            self.paint_icon(b["icon"], cx, cy, scale, face)
+
+    def paint_icon(self, icon, cx, cy, scale, face):
+        """The speaker: sound waves when music is on, a red X when it is muted."""
+        c = self.canvas
+
+        def pt(x, y):
+            return cx + (x - 1) * scale, cy + y * scale
+        body = [v for p in ((-9, -4), (-5, -4), (1, -9), (1, 9), (-5, 4), (-9, 4)) for v in pt(*p)]
+        c.coords(icon["body"], *body)
+        if self.muted:
+            c.itemconfig(icon["body"], fill=THEME["muted"])
+            for wave in ("wave1", "wave2"):
+                c.itemconfig(icon[wave], outline="")
+            c.coords(icon["x1"], *pt(5, -5), *pt(13, 3))
+            c.coords(icon["x2"], *pt(13, -5), *pt(5, 3))
+            for line in ("x1", "x2"):
+                c.itemconfig(icon[line], fill="#ff5a5a", width=max(2, 2.4 * scale))
+        else:
+            c.itemconfig(icon["body"], fill=face)
+            for wave, radius in (("wave1", 6), ("wave2", 10)):
+                x1, y1 = pt(1 - radius, -radius)
+                x2, y2 = pt(1 + radius, radius)
+                c.coords(icon[wave], x1, y1, x2, y2)
+                c.itemconfig(icon[wave], outline=face if radius == 6 else mix(face, THEME["bg"], 0.35),
+                             width=max(2, 2 * scale))
+            for line in ("x1", "x2"):
+                c.itemconfig(icon[line], fill="")
 
     def bind_button(self, item, key):
         self.canvas.tag_bind(item, "<Enter>", lambda e: self.on_hover(key))
@@ -2092,14 +2196,14 @@ class Gester:
 
     def on_click(self, event, key):
         play(self.click_sound)
-        self.ripples.append([event.x, event.y, 5])
+        self.ripples.append([self.canvas.canvasx(event.x), self.canvas.canvasy(event.y), 5])
         self.buttons[key]["kick"] = 0.16     # pops bigger
         self.buttons[key]["flash"] = 1.0     # and flashes
         self.buttons[key]["action"]()
 
     def on_jester_click(self, event, jester):
         play(self.jester_sound)
-        self.ripples.append([event.x, event.y, 5])
+        self.ripples.append([self.canvas.canvasx(event.x), self.canvas.canvasy(event.y), 5])
         jester.poke()
         self.canvas.itemconfig(self.status, text=CRITTER_SAYS[THEME["critter"]])
 
@@ -2149,8 +2253,10 @@ class Gester:
         self.update_music()
 
         # rainbow bar along the top
-        for i, rect in enumerate(self.bar):
-            self.canvas.itemconfig(rect, fill=rainbow(self.hue + i * 0.012))
+        first = max(0, int((VIEW["x0"] + BAR_PAD) // BAR_W))        # only color the pieces you can see
+        last = min(len(self.bar), int((VIEW["x1"] + BAR_PAD) // BAR_W) + 2)
+        for i in range(first, last):
+            self.canvas.itemconfig(self.bar[i], fill=rainbow(self.hue + i * 0.012))
 
         # 3D titles: rainbow faces, with a shine that sweeps across the big GESTER letters
         if self.page == "home":
@@ -2201,15 +2307,17 @@ class Gester:
         # floating particles
         for p in self.particles:
             p["y"] -= p["speed"] * (3 if self.party else 1)
-            if p["y"] < -10:
-                p["y"] = HEIGHT + 10
-                p["x"] = random.randint(0, WIDTH)
+            if (p["y"] < VIEW["y0"] - 10 or p["y"] > VIEW["y1"] + 10
+                    or p["x"] > VIEW["x1"] or p["x"] < VIEW["x0"] - 10):
+                p["y"] = VIEW["y1"] + 10
+                p["x"] = random.uniform(VIEW["x0"], VIEW["x1"])
             self.canvas.coords(p["id"], p["x"], p["y"], p["x"] + p["size"], p["y"] + p["size"])
             self.canvas.itemconfig(p["id"], fill=rainbow(self.hue + p["x"] / WIDTH, 0.6, 0.9))
 
         # party mode sprinkles random ripples
         if self.party and self.frame % 12 == 0:
-            self.ripples.append([random.randint(0, WIDTH), random.randint(200, HEIGHT), 5])
+            self.ripples.append([random.randint(int(VIEW["x0"]), int(VIEW["x1"])),
+                                 random.randint(int(VIEW["y0"]) + 200, int(VIEW["y1"])), 5])
 
         # click ripples
         self.canvas.delete("ripple")
