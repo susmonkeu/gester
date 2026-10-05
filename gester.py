@@ -47,15 +47,15 @@ BLOCKED_WORDS = {"nigger", "nigga"}
 
 # AUTO-UPDATING SOUNDS: your GitHub repo as "yourname/gester" ("" = off).
 # Put your sound files in a folder called "sounds" in that repo.
-GITHUB_REPO = "https://github.com/susmonkeu/gester"
+GITHUB_REPO = "susmonkeu/gester"
 
 # MULTIPLAYER: paste your Discord channel IDs here (0 = that feature is off)
 SYNC_CHANNEL_ID = 1556072377530458174      # the channel that keeps everyone's name list in sync
 CHAT_CHANNEL_ID = 1556072398111903784      # the channel the chat box uses
-BOARD_CHANNEL_ID = 1556556283266469928     # the channel the Milloku leaderboard uses (make a new one!)
+BOARD_CHANNEL_ID = 1556556283266469928     # the channel the Milloku leaderboard uses
 USE_MESSAGE_CONTENT_INTENT = False   # only set True if the chat shows blank messages
 CHAT_W = 300             # how much wider the window gets when the chat is open
-VERSION = "1.6.0"          # change this each update so you can see it worked
+VERSION = "1.6.1"          # change this each update so you can see it worked
 
 HOVER_SOUND = "hover.wav"
 CLICK_SOUND = "click.wav"
