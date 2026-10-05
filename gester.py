@@ -20,7 +20,7 @@ BEFORE RUNNING:
 RUN:  python gester.py
 """
 import tkinter as tk
-import colorsys, math, random, os, sys, json, asyncio, threading, wave, hashlib
+import colorsys, math, random, os, sys, json, asyncio, threading, wave, hashlib, time
 from collections import deque
 
 # ---------- SETTINGS (change these to experiment!) ----------
@@ -34,23 +34,28 @@ NUM_JESTERS = 6
 # Friends open the CHAT tab and click "ID" to copy theirs, then send it to you.
 # You add a line below, upload gester.py, and they can chat. Remove a line to remove them.
 ROSTER = {
-    # "64ec516005f3": "Flug",
-    # "2cea0f4f79e0": "Emii",
+    "64ec516005f3": "Flug",
+    "2cea0f4f79e0": "Emii",
 }
 
+# YOUR ID: only this person gets the CLEAR button in the chat panel.
+# (Click ID in the CHAT tab to copy yours, then paste it between the quotes.)
+OWNER_ID = "64ec516005f3"
+
 # Messages containing these words are blocked (whole words only). Add your own!
-BLOCKED_WORDS = {"fuck", "fucking", "shit", "bitch", "asshole", "dick", "cunt"}
+BLOCKED_WORDS = {"nigger", "nigga"}
 
 # AUTO-UPDATING SOUNDS: your GitHub repo as "yourname/gester" ("" = off).
 # Put your sound files in a folder called "sounds" in that repo.
-GITHUB_REPO = ""
+GITHUB_REPO = "https://github.com/susmonkeu/gester/tree/main/sounds"
 
 # MULTIPLAYER: paste your Discord channel IDs here (0 = that feature is off)
 SYNC_CHANNEL_ID = 1556072377530458174      # the channel that keeps everyone's name list in sync
 CHAT_CHANNEL_ID = 1556072398111903784      # the channel the chat box uses
+BOARD_CHANNEL_ID = 1556038020485091389     # the channel the Milloku leaderboard uses (make a new one!)
 USE_MESSAGE_CONTENT_INTENT = False   # only set True if the chat shows blank messages
 CHAT_W = 300             # how much wider the window gets when the chat is open
-VERSION = "1.5.0"          # change this each update so you can see it worked
+VERSION = "1.6.0"          # change this each update so you can see it worked
 
 HOVER_SOUND = "hover.wav"
 CLICK_SOUND = "click.wav"
@@ -378,6 +383,40 @@ def read_chat(content):
         return None
 
 
+def read_clear(content):
+    """Is this a genuine, fresh 'clear the chat' message from the owner? Returns its ID or None."""
+    try:
+        if not (OWNER_ID and content.startswith("GESTER-CLEAR ")):
+            return None
+        public_hex, e_hex, s_hex, message_id, stamp = content[13:].split(":")
+        public = int(public_hex, 16)
+        if fingerprint(public) != OWNER_ID or abs(time.time() - int(stamp)) > 300:
+            return None      # not the owner, or an old copy someone is replaying
+        if not verify(public, f"CLEAR|{message_id}|{stamp}", int(e_hex, 16), int(s_hex, 16)):
+            return None
+        return message_id
+    except Exception:
+        return None
+
+
+def read_board(content):
+    """Check a leaderboard message. Returns (id, levels_beaten, time) or None if fake."""
+    try:
+        if not content.startswith("GESTER-BOARD "):
+            return None
+        public_hex, e_hex, s_hex, level, stamp = content[13:].split(":")
+        public = int(public_hex, 16)
+        who = fingerprint(public)
+        level, stamp = int(level), int(stamp)
+        if who not in ROSTER or not 0 <= level <= 100:
+            return None
+        if not verify(public, f"BOARD|{level}|{stamp}", int(e_hex, 16), int(s_hex, 16)):
+            return None
+        return who, level, stamp
+    except Exception:
+        return None
+
+
 _LOOKALIKES = str.maketrans("@013$5", "aoiess")
 
 
@@ -521,6 +560,26 @@ def make_puzzle(level):
     return puzzle, solution
 
 
+BOARD_FILE = os.path.join(HERE, "leaderboard.json")
+
+
+def load_board():
+    """Last known scores {id: [levels_beaten, time]}, so the board survives restarts."""
+    try:
+        with open(BOARD_FILE) as f:
+            return {k: [int(v[0]), int(v[1])] for k, v in json.load(f).items()}
+    except Exception:
+        return {}
+
+
+def save_board(board):
+    try:
+        with open(BOARD_FILE, "w") as f:
+            json.dump(board, f)
+    except OSError:
+        pass
+
+
 # ---------- THE DISCORD BOT ----------
 try:
     import discord
@@ -583,6 +642,8 @@ class DiscordLink:
                 self.inbox.append(("sync", message.content))
             elif message.channel.id == CHAT_CHANNEL_ID:
                 self.inbox.append(("chat", message.content))
+            elif message.channel.id == BOARD_CHANNEL_ID:
+                self.inbox.append(("board", message.content))
 
         try:
             self.loop.run_until_complete(self.client.start(self.token))
@@ -604,6 +665,10 @@ class DiscordLink:
                 channel = await self.find_channel(CHAT_CHANNEL_ID)
                 found = [m.content async for m in channel.history(limit=40)]
                 self.inbox.append(("chat_history", found[::-1]))
+            if BOARD_CHANNEL_ID:
+                channel = await self.find_channel(BOARD_CHANNEL_ID)
+                found = [m.content async for m in channel.history(limit=300)]
+                self.inbox.append(("board_history", found[::-1]))
         except Exception as error:
             self.inbox.append(("error", f"Discord history error: {error}"))
 
@@ -630,6 +695,22 @@ class DiscordLink:
         error = future.exception()
         if error:
             self.inbox.append(("error", f"Discord error: {error}"))
+
+    def clear_chat_channel(self, marker):
+        """Post the signed 'clear' message, wait a moment, then delete everything in the chat channel."""
+        if self.problem or not self.ready or not CHAT_CHANNEL_ID:
+            return False
+
+        async def go():
+            channel = await self.find_channel(CHAT_CHANNEL_ID)
+            await channel.send(marker, allowed_mentions=discord.AllowedMentions.none())
+            await asyncio.sleep(1.5)     # let everyone's Gester see the message first
+            try:
+                await channel.purge(limit=None, bulk=True)
+            except discord.Forbidden:    # no "Manage Messages": delete the bot's own messages one by one
+                await channel.purge(limit=None, bulk=False)
+        asyncio.run_coroutine_threadsafe(go(), self.loop).add_done_callback(self.report_failure)
+        return True
 
     def post_sync(self, kind, name=""):
         return self.post(f"GESTER-SYNC {self.client_id} {kind} {name}".strip(), SYNC_CHANNEL_ID)
@@ -725,12 +806,14 @@ class Gester:
         self.my_fp = fingerprint(self.public)
         self.username = ROSTER.get(self.my_fp, "Guest")
         self.seen_ids = set()    # chat message IDs we've shown (stops copy-pasted repeats)
+        self.clear_chat_armed = False
         self.chat_open = False
         self.unread = 0
         self.clear_armed = False
         self.spinning = False
         self.bot = DiscordLink()
         self.updates = deque()           # news from the background sound updater
+        self.board = load_board()        # Milloku leaderboard: {id: [levels beaten, time]}
         self.su_done = load_progress()   # sudoku levels beaten
         self.su_level = 1
         self.su_started = False
@@ -760,6 +843,7 @@ class Gester:
         self.refresh_names()
         self.make_sudoku_page()
         self.make_themes_page()
+        self.make_board_page()
         self.make_chat_panel()
 
         self.status = self.canvas.create_text(
@@ -820,11 +904,12 @@ class Gester:
             WIDTH / 2, 60, text="CHOOSE A TOOL", tags="menu", font=("Helvetica", 40, "bold"))
         tools = [("NAME CHOOSER", lambda: self.show_page("names")),
                  ("MILLOKU", self.open_sudoku),
+                 ("LEADERBOARD", self.open_board),
                  ("THEMES", lambda: self.show_page("themes"))]
         for i, (label, action) in enumerate(tools):
-            y1 = 130 + i * 70
+            y1 = 118 + i * 62
             self.make_button(label, label, 210, y1, 510, y1 + 52, "menu", action)
-        self.make_button("BACK", "BACK", 260, 355, 460, 400, "menu", self.on_back, size=14)
+        self.make_button("BACK", "BACK", 260, 385, 460, 430, "menu", self.on_back, size=14)
 
     # --- the NAME CHOOSER page ---
     def make_names_page(self):
@@ -932,6 +1017,18 @@ class Gester:
                     self.show_chat(content, quiet=True)
             elif kind == "chat":
                 self.show_chat(data)
+            elif kind == "board_history":
+                for content in data:
+                    result = read_board(content)
+                    if result:
+                        self.board_update(*result)
+                self.after_board_history()
+            elif kind == "board":
+                result = read_board(data)
+                if result and self.board_update(*result):
+                    save_board(self.board)
+                    if self.page == "board":
+                        self.refresh_board()
             elif kind == "error":
                 self.canvas.itemconfig(self.status, text=data[:90])
         if self.names != before:
@@ -971,6 +1068,8 @@ class Gester:
         c.create_text(x0 + 15, 65, anchor="w", text="CHAT", fill="white", tags="chat",
                       font=("Helvetica", 16, "bold"))
         self.make_button("CHATMIN", "-", x1 - 45, 52, x1 - 10, 78, "chat", self.toggle_chat, size=14)
+        if OWNER_ID and self.my_fp == OWNER_ID:      # only the owner gets this button
+            self.make_button("CHATCLEAR", "CLEAR", x1 - 120, 52, x1 - 55, 78, "chat", self.clear_chat, size=10)
         c.create_text(x0 + 15, 100, anchor="w", text="your name", fill="#6a6a88",
                       font=("Helvetica", 10), tags="chat")
         self.name_entry = self.make_entry()
@@ -1011,6 +1110,37 @@ class Gester:
         label = f"CHAT ({self.unread})" if self.unread else "CHAT"
         self.canvas.itemconfig(self.buttons["CHATICON"]["text"], text=label)
 
+    def wipe_chat_log(self):
+        log = self.chat_log
+        log.config(state="normal")
+        log.delete("1.0", "end")
+        log.tag_config("note", foreground=THEME["muted"])
+        log.insert("end", "chat cleared\n", "note")
+        log.config(state="disabled")
+
+    def clear_chat(self):
+        if not (OWNER_ID and self.my_fp == OWNER_ID):
+            return
+        if not self.clear_chat_armed:    # ask twice, because this can't be undone
+            self.clear_chat_armed = True
+            self.canvas.itemconfig(self.status, text="Click CLEAR again to delete the ENTIRE chat for everyone")
+            self.root.after(3000, self.disarm_clear_chat)
+            return
+        self.clear_chat_armed = False
+        message_id = "%08x" % _RANDOM.randrange(16 ** 8)
+        stamp = int(time.time())
+        e, s = sign(self.secret, f"CLEAR|{message_id}|{stamp}")
+        marker = f"GESTER-CLEAR {self.public:x}:{e:x}:{s:x}:{message_id}:{stamp}"
+        if self.bot.clear_chat_channel(marker):
+            self.seen_ids.add(message_id)
+            self.wipe_chat_log()
+            self.canvas.itemconfig(self.status, text="Clearing the chat for everyone...")
+        else:
+            self.canvas.itemconfig(self.status, text="Can't clear: bot isn't connected")
+
+    def disarm_clear_chat(self):
+        self.clear_chat_armed = False
+
     def copy_id(self):
         try:
             self.root.clipboard_clear()
@@ -1044,6 +1174,14 @@ class Gester:
                 self.canvas.itemconfig(self.status, text="Can't send: bot isn't connected")
 
     def show_chat(self, content, quiet=False):
+        if content.startswith("GESTER-CLEAR "):
+            marker_id = None if quiet else read_clear(content)   # old ones in history are ignored
+            if marker_id and marker_id not in self.seen_ids:
+                self.seen_ids.add(marker_id)
+                self.wipe_chat_log()
+                self.unread = 0
+                self.update_chat_icon()
+            return
         message = read_chat(content)
         if message is None:
             return    # fake, unsigned, or from someone who isn't approved
@@ -1067,6 +1205,74 @@ class Gester:
             if not self.chat_open:
                 self.unread += 1
                 self.update_chat_icon()
+
+    # --- the LEADERBOARD page ---
+    def make_board_page(self):
+        c = self.canvas
+        self.board_title = c.create_text(WIDTH / 2, 45, text="MILLOKU LEADERBOARD", tags="board",
+                                         font=("Helvetica", 30, "bold"))
+        self.board_note = c.create_text(WIDTH / 2, 82, text="", fill="#8888aa",
+                                        font=("Helvetica", 11), tags="board")
+        self.board_rows = []
+        for i in range(10):
+            y = 118 + i * 26
+            self.board_rows.append({
+                "rank": c.create_text(210, y, anchor="e", text="", fill="#8888aa",
+                                      font=("Helvetica", 14, "bold"), tags="board"),
+                "name": c.create_text(232, y, anchor="w", text="", fill="white",
+                                      font=("Helvetica", 14, "bold"), tags="board"),
+                "level": c.create_text(515, y, anchor="e", text="", fill="#8888aa",
+                                       font=("Helvetica", 13), tags="board")})
+        self.make_button("BOARD_BACK", "BACK", 260, 385, 460, 430, "board",
+                         lambda: self.show_page("menu"), size=14)
+
+    def open_board(self):
+        self.show_page("board")
+        self.refresh_board()
+        if not BOARD_CHANNEL_ID:
+            self.canvas.itemconfig(self.status, text="Leaderboard isn't shared yet (BOARD_CHANNEL_ID)")
+
+    def board_update(self, who, level, stamp):
+        """Keep each player's best result. Returns True if the board changed."""
+        old = self.board.get(who)
+        if old is None or level > old[0] or (level == old[0] and stamp < old[1]):
+            self.board[who] = [level, stamp]
+            return True
+        return False
+
+    def refresh_board(self):
+        c = self.canvas
+        # most levels first; if tied, whoever got there first
+        entries = sorted(((level, stamp, who) for who, (level, stamp) in self.board.items()
+                          if who in ROSTER and level > 0), key=lambda t: (-t[0], t[1]))
+        c.itemconfig(self.board_note, text="" if entries else "No scores yet. Beat a Milloku level to get on the board!")
+        for i, row in enumerate(self.board_rows):
+            if i < len(entries):
+                level, stamp, who = entries[i]
+                c.itemconfig(row["rank"], text=str(i + 1))
+                c.itemconfig(row["name"], text=ROSTER[who] + ("  (you)" if who == self.my_fp else ""))
+                c.itemconfig(row["level"], text="ALL 100 DONE!" if level >= 100 else f"level {level} / 100")
+            else:
+                for part in row.values():
+                    c.itemconfig(part, text="")
+
+    def after_board_history(self):
+        save_board(self.board)
+        if self.page == "board":
+            self.refresh_board()
+        if self.su_done > self.board.get(self.my_fp, [0, 0])[0]:
+            self.post_score()      # share progress the board doesn't know about yet
+
+    def post_score(self):
+        if self.my_fp not in ROSTER or not BOARD_CHANNEL_ID or self.su_done <= 0:
+            return
+        stamp = int(time.time())
+        e, s = sign(self.secret, f"BOARD|{self.su_done}|{stamp}")
+        if self.bot.post(f"GESTER-BOARD {self.public:x}:{e:x}:{s:x}:{self.su_done}:{stamp}", BOARD_CHANNEL_ID):
+            self.board_update(self.my_fp, self.su_done, stamp)
+            save_board(self.board)
+            if self.page == "board":
+                self.refresh_board()
 
     # --- the THEMES page ---
     def make_themes_page(self):
@@ -1265,6 +1471,7 @@ class Gester:
         if level > self.su_done:
             self.su_done = level
             save_progress(level)
+            self.post_score()
         play(self.jester_sound)
         for _ in range(10 if level < 100 else 25):
             self.ripples.append([random.randint(SU_X, SU_X + 9 * SU_CELL),
@@ -1370,7 +1577,7 @@ class Gester:
     def show_page(self, name):
         """Show one page and hide the other."""
         self.page = name
-        for page in ("home", "menu", "names", "sudoku", "themes"):
+        for page in ("home", "menu", "names", "sudoku", "themes", "board"):
             self.canvas.itemconfig(page, state="normal" if page == name else "hidden")
         self.clear_hover()
         if name == "names":
@@ -1462,6 +1669,12 @@ class Gester:
         self.canvas.itemconfig(self.options_title, fill=rainbow(self.hue * 2))
         self.canvas.itemconfig(self.names_title, fill=rainbow(self.hue * 2))
         self.canvas.itemconfig(self.themes_title, fill=rainbow(self.hue * 2))
+        self.canvas.itemconfig(self.board_title, fill=rainbow(self.hue * 2))
+        if self.page == "board":      # the top three glow
+            for i, row in enumerate(self.board_rows[:3]):
+                if self.canvas.itemcget(row["name"], "text"):
+                    for part in ("rank", "name"):
+                        self.canvas.itemconfig(row[part], fill=rainbow(self.hue * 2 + i * 0.15))
         self.canvas.itemconfig(self.result_text, fill=rainbow(self.hue * 4))
 
         # buttons glow with the rainbow when hovered
