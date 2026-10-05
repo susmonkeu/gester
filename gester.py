@@ -20,7 +20,7 @@ BEFORE RUNNING:
 RUN:  python gester.py
 """
 import tkinter as tk
-import colorsys, math, random, os, sys, json, asyncio, threading
+import colorsys, math, random, os, sys, json, asyncio, threading, wave, hashlib
 from collections import deque
 
 # ---------- SETTINGS (change these to experiment!) ----------
@@ -29,6 +29,17 @@ NORMAL_SPEED = 0.004      # how fast the rainbow cycles
 PARTY_SPEED = 0.02        # rainbow speed in Party Mode
 NUM_PARTICLES = 40
 NUM_JESTERS = 6
+
+# WHO CAN CHAT: each person's ID -> the name shown for them.
+# Friends open the CHAT tab and click "ID" to copy theirs, then send it to you.
+# You add a line below, upload gester.py, and they can chat. Remove a line to remove them.
+ROSTER = {
+    # "3fa9c2e1b7d4": "Flug",
+    # "9c01d5e2a8b3": "Emii",
+}
+
+# Messages containing these words are blocked (whole words only). Add your own!
+BLOCKED_WORDS = {"fuck", "fucking", "shit", "bitch", "asshole", "dick", "cunt"}
 
 # AUTO-UPDATING SOUNDS: your GitHub repo as "yourname/gester" ("" = off).
 # Put your sound files in a folder called "sounds" in that repo.
@@ -39,12 +50,14 @@ SYNC_CHANNEL_ID = 1556072377530458174      # the channel that keeps everyone's n
 CHAT_CHANNEL_ID = 1556072398111903784      # the channel the chat box uses
 USE_MESSAGE_CONTENT_INTENT = False   # only set True if the chat shows blank messages
 CHAT_W = 300             # how much wider the window gets when the chat is open
-VERSION = "1.4.1"          # change this each update so you can see it worked
+VERSION = "1.5.0"          # change this each update so you can see it worked
 
 HOVER_SOUND = "hover.wav"
 CLICK_SOUND = "click.wav"
 JESTER_SOUND = "jester.wav"
 PARTY_SONG = "party_song.mp3"
+CHAT_SEND_SOUND = "chat_send.wav"          # plays when YOU send a chat message
+CHAT_RECEIVE_SOUND = "chat_receive.wav"    # plays when SOMEONE ELSE sends one
 # -------------------------------------------------------------
 
 # The folder Gester lives in (works for both gester.py and the packaged .exe)
@@ -57,13 +70,15 @@ else:
 BUNDLE = getattr(sys, "_MEIPASS", HERE)
 
 
-# Sounds downloaded from GitHub are kept here
-SYNC_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Gester", "sounds")
+# Things Gester keeps on each computer (downloaded sounds, your secret chat ID)
+DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Gester")
+SYNC_DIR = os.path.join(DATA_DIR, "sounds")
+DEFAULT_DIR = os.path.join(DATA_DIR, "defaults")   # built-in beeps, used if a sound is missing
 
 
 def find_file(filename):
     """Look next to the program, then in the downloaded sounds, then inside the .exe."""
-    for folder in (HERE, SYNC_DIR, BUNDLE):
+    for folder in (HERE, SYNC_DIR, BUNDLE, DEFAULT_DIR):
         path = os.path.join(folder, filename)
         if os.path.exists(path):
             return path
@@ -112,6 +127,31 @@ def sync_sounds(updates):
             updates.append(("sounds", changed))
     except Exception:
         pass    # offline, rate-limited, or no sounds folder yet: just keep what we have
+
+
+def make_default_sounds():
+    """Make simple built-in chat beeps, but only for sounds you haven't provided."""
+    defaults = {CHAT_SEND_SOUND: [(660, 60), (880, 90)],        # quick rising "whoosh"
+                CHAT_RECEIVE_SOUND: [(988, 80), (784, 140)]}    # soft falling "ding-dong"
+    for name, notes in defaults.items():
+        if find_file(name) is not None:
+            continue
+        try:
+            os.makedirs(DEFAULT_DIR, exist_ok=True)
+            rate = 22050
+            data = bytearray()
+            for frequency, milliseconds in notes:
+                count = int(rate * milliseconds / 1000)
+                for i in range(count):
+                    value = int(9000 * math.sin(2 * math.pi * frequency * i / rate) * (1 - i / count))
+                    data += value.to_bytes(2, "little", signed=True)
+            with wave.open(os.path.join(DEFAULT_DIR, name), "wb") as f:
+                f.setnchannels(1)
+                f.setsampwidth(2)
+                f.setframerate(rate)
+                f.writeframes(bytes(data))
+        except Exception:
+            pass
 
 
 # ---------- SOUND (uses pygame so music + effects can play together) ----------
@@ -247,6 +287,106 @@ def save_names(names):
         print("Could not save names.json")
 
 
+# ---------- CHAT SECURITY: names that can't be faked ----------
+# Every install makes a secret key (kept in your Gester data folder, never shared).
+# Messages are signed with it, and everyone checks the signature against ROSTER, so
+# nobody can type as someone else. (Schnorr signatures; the numbers below are a
+# standard kind of public "group" that everyone uses.)
+GROUP_P = int(
+    "8957b00e8f30b5ff68e4e5fb4881cf73dbc5c4fc21a1f22c6509f833813331cf"
+    "8f16254c87a24e6b6aff54a6998a1861e4908da63b9e7fcc1b859f5d9be83649"
+    "c25b36b5e3ccf4156962180aed318a4be56efe639f2447b3b7d5eea95ad7a1bf"
+    "a5b9ce1d474addd7091b1fd914ffdd2e0c722d93061a6fcdab1ccc73a02a271e"
+    "d18851707d46c1f62464368b569710707ed8193b55f75a8c735411cb60168651"
+    "641484c6f6f12402548935eef64c16272484d8943bfff828aac57f6cd55006a7"
+    "6644ec5477665472012d5ef74eba1039ba99dd9b0c1f99f05124a27fb6ada137"
+    "6756043f54e4a8075d6b801c9a44bac03f006b8bf43184773f1290ef2ae1cbb3", 16)
+GROUP_Q = int(
+    "ae5993c877ddc667c6a93d117c5413aec1299bceaf979a541d33798a6f278c67", 16)
+GROUP_G = int(
+    "1de7067a94655927a3961abfd1bfd2a497c4a0374e29d5de0abedb81d873f2d9"
+    "208c25aed3f3dc2c90b7d97e23b3768f14e0d0b2ec04af49f38d7f7d785340f6"
+    "547884352a9236eb7cd0e5015d04f5e59af9fbad61e8d547d0a0181b19a1e2b6"
+    "6fa12b217eee5e3a735c9f1c1d7bdb3ef0e62047b3f9361998378b2e73304284"
+    "b6a9b6cb99aa9a2fa4ccb5f40bf5c7f104f52c7507ad74ae2dd724a7001c6b1e"
+    "9207b09f5d860cb40439ab807d6c603a9fa16c3f7a020d3e3d422ae6214748ed"
+    "63211d1b59d5ad78aa8efa1b48d56f0c719ad3e3007f4d2682385162dd1f6135"
+    "b685051ffa9d51cf99327e71c589b0a13ee4e0abd203824d577c53feaddfb1fe", 16)
+_RANDOM = random.SystemRandom()
+IDENTITY_FILE = os.path.join(DATA_DIR, "identity.json")
+
+
+def _challenge(r, message):
+    text = f"{r}|{message}".encode()
+    return int(hashlib.sha256(text).hexdigest(), 16) % GROUP_Q
+
+
+def load_identity():
+    """This install's (secret key, public key). Made the first time Gester runs."""
+    try:
+        with open(IDENTITY_FILE) as f:
+            secret = int(json.load(f)["x"], 16)
+        if not 0 < secret < GROUP_Q:
+            raise ValueError
+    except Exception:
+        secret = _RANDOM.randrange(1, GROUP_Q)
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(IDENTITY_FILE, "w") as f:
+                json.dump({"x": f"{secret:x}"}, f)
+        except OSError:
+            pass
+    return secret, pow(GROUP_G, secret, GROUP_P)
+
+
+def fingerprint(public):
+    """The short ID people send you to get on the ROSTER."""
+    return hashlib.sha256(f"{public:x}".encode()).hexdigest()[:12]
+
+
+def sign(secret, message):
+    k = _RANDOM.randrange(1, GROUP_Q)
+    e = _challenge(pow(GROUP_G, k, GROUP_P), message)
+    return e, (k + secret * e) % GROUP_Q
+
+
+def verify(public, message, e, s):
+    if not (1 < public < GROUP_P and pow(public, GROUP_Q, GROUP_P) == 1):
+        return False
+    if not (0 < e < GROUP_Q and 0 <= s < GROUP_Q):
+        return False
+    r = pow(GROUP_G, s, GROUP_P) * pow(public, GROUP_Q - e, GROUP_P) % GROUP_P
+    return e == _challenge(r, message)
+
+
+def read_chat(content):
+    """Check a chat message from Discord. Returns (id, name, text, message_id) or None."""
+    try:
+        body, _, tail = content.rpartition(" ||")
+        if not (tail.endswith("||") and body.startswith("**") and "**: " in body[2:]):
+            return None
+        text = body[2:].split("**: ", 1)[1]
+        public_hex, e_hex, s_hex, message_id = tail[:-2].split(":")
+        public = int(public_hex, 16)
+        who = fingerprint(public)
+        if who not in ROSTER:
+            return None      # not on the approved list
+        if not verify(public, f"{message_id}|{text}", int(e_hex, 16), int(s_hex, 16)):
+            return None      # fake or changed message
+        return who, ROSTER[who], text, message_id
+    except Exception:
+        return None
+
+
+_LOOKALIKES = str.maketrans("@013$5", "aoiess")
+
+
+def has_blocked(text):
+    """True if the text contains a blocked word (also catches things like sh1t)."""
+    cleaned = "".join(ch if ch.isalpha() else " " for ch in text.lower().translate(_LOOKALIKES))
+    return any(word in BLOCKED_WORDS for word in cleaned.split())
+
+
 # ---------- SHARED NAME LIST + USERNAME ----------
 USER_FILE = os.path.join(HERE, "username.txt")
 SEEDED_FILE = os.path.join(HERE, "synced.flag")
@@ -271,7 +411,7 @@ def save_username(name):
 def apply_event(names, kind, name=""):
     """Change a name list the way a shared ADD / REMOVE / CLEAR event says."""
     lowered = [n.lower() for n in names]
-    if kind == "ADD" and name and name.lower() not in lowered:
+    if kind == "ADD" and name and not has_blocked(name) and name.lower() not in lowered:
         names.append(name)
     elif kind == "REMOVE" and name.lower() in lowered:
         names.pop(lowered.index(name.lower()))
@@ -581,7 +721,10 @@ class Gester:
         self.ripples = []   # expanding rings made by clicks
         self.frame = 0
         self.names = load_names()   # the Name Chooser list (saved between runs)
-        self.username = load_username()
+        self.secret, self.public = load_identity()
+        self.my_fp = fingerprint(self.public)
+        self.username = ROSTER.get(self.my_fp, "Guest")
+        self.seen_ids = set()    # chat message IDs we've shown (stops copy-pasted repeats)
         self.chat_open = False
         self.unread = 0
         self.clear_armed = False
@@ -602,6 +745,9 @@ class Gester:
         self.hover_sound = load_sound(HOVER_SOUND, 0.5)
         self.click_sound = load_sound(CLICK_SOUND)
         self.jester_sound = load_sound(JESTER_SOUND)
+        make_default_sounds()
+        self.chat_send_sound = load_sound(CHAT_SEND_SOUND, 0.8)
+        self.chat_receive_sound = load_sound(CHAT_RECEIVE_SOUND, 0.8)
 
         # Things created first are drawn at the back, so order matters here.
         self.buttons = {}
@@ -719,6 +865,9 @@ class Gester:
         name = " ".join(self.entry.get().split())[:30]
         if not name:
             return
+        if has_blocked(name):
+            self.canvas.itemconfig(self.status, text="That name isn't allowed")
+            return
         if name.lower() in [n.lower() for n in self.names]:
             self.canvas.itemconfig(self.status, text=f"{name} is already in the list")
             return
@@ -766,6 +915,8 @@ class Gester:
                 self.hover_sound = load_sound(HOVER_SOUND, 0.5)
                 self.click_sound = load_sound(CLICK_SOUND)
                 self.jester_sound = load_sound(JESTER_SOUND)
+                self.chat_send_sound = load_sound(CHAT_SEND_SOUND, 0.8)
+                self.chat_receive_sound = load_sound(CHAT_RECEIVE_SOUND, 0.8)
                 self.canvas.itemconfig(self.status, text=f"Updated {count} sound file(s)!")
         before = list(self.names)
         while self.bot.inbox:
@@ -823,10 +974,10 @@ class Gester:
         c.create_text(x0 + 15, 100, anchor="w", text="your name", fill="#6a6a88",
                       font=("Helvetica", 10), tags="chat")
         self.name_entry = self.make_entry()
-        self.name_entry.insert(0, self.username)
-        self.name_entry.bind("<Return>", lambda e: self.set_username())
+        self.name_entry.insert(0, self.username if self.my_fp in ROSTER else "(not approved)")
+        self.name_entry.config(state="readonly", readonlybackground="#161622")   # names come from ROSTER
         c.create_window(x0 + 80, 88, anchor="nw", window=self.name_entry, width=125, height=24, tags="chat")
-        self.make_button("SETNAME", "SET", x1 - 55, 88, x1 - 10, 112, "chat", self.set_username, size=10)
+        self.make_button("COPYID", "ID", x1 - 55, 88, x1 - 10, 112, "chat", self.copy_id, size=10)
         self.chat_log = tk.Text(self.root, bg="#10101a", fg="white", font=("Helvetica", 11),
                                 wrap="word", relief="flat", highlightthickness=0, padx=6, pady=4,
                                 state="disabled", cursor="arrow")
@@ -860,13 +1011,17 @@ class Gester:
         label = f"CHAT ({self.unread})" if self.unread else "CHAT"
         self.canvas.itemconfig(self.buttons["CHATICON"]["text"], text=label)
 
-    def set_username(self):
-        name = self.name_entry.get().replace("*", "").strip()[:20] or "Guest"
-        self.username = name
-        self.name_entry.delete(0, "end")
-        self.name_entry.insert(0, name)
-        save_username(name)
-        self.canvas.itemconfig(self.status, text=f"You are now {name}")
+    def copy_id(self):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.my_fp)
+        except tk.TclError:
+            pass
+        if self.my_fp in ROSTER:
+            text = f"You are {ROSTER[self.my_fp]}. Your ID ({self.my_fp}) is copied."
+        else:
+            text = f"Your ID {self.my_fp} is copied. Send it to the owner to get approved!"
+        self.canvas.itemconfig(self.status, text=text)
 
     def send_chat(self):
         text = " ".join(self.chat_entry.get().split())[:300]
@@ -874,15 +1029,30 @@ class Gester:
             return
         if not CHAT_CHANNEL_ID:
             self.canvas.itemconfig(self.status, text="Chat isn't set up yet (CHAT_CHANNEL_ID)")
-        elif self.bot.post(f"**{self.username}**: {text}", CHAT_CHANNEL_ID):
-            self.chat_entry.delete(0, "end")   # it appears when Discord sends it back to us
+        elif self.my_fp not in ROSTER:
+            self.canvas.itemconfig(self.status, text="Not approved to chat yet: click ID and send it to the owner")
+        elif has_blocked(text):
+            self.canvas.itemconfig(self.status, text="Watch your language! Message not sent.")
         else:
-            self.canvas.itemconfig(self.status, text="Can't send: bot isn't connected")
+            message_id = "%08x" % _RANDOM.randrange(16 ** 8)
+            e, s = sign(self.secret, f"{message_id}|{text}")
+            message = f"**{self.username}**: {text} ||{self.public:x}:{e:x}:{s:x}:{message_id}||"
+            if self.bot.post(message, CHAT_CHANNEL_ID):
+                self.chat_entry.delete(0, "end")   # it appears when Discord sends it back to us
+                play(self.chat_send_sound)
+            else:
+                self.canvas.itemconfig(self.status, text="Can't send: bot isn't connected")
 
     def show_chat(self, content, quiet=False):
-        if not (content.startswith("**") and "**: " in content[2:]):
-            return
-        name, text = content[2:].split("**: ", 1)
+        message = read_chat(content)
+        if message is None:
+            return    # fake, unsigned, or from someone who isn't approved
+        who, name, text, message_id = message
+        if message_id in self.seen_ids:
+            return    # a repeated copy of a message we already showed
+        self.seen_ids.add(message_id)
+        if has_blocked(text):
+            text = "[hidden by the language filter]"
         hue = sum(ord(ch) for ch in name) % 36    # same name = same color for everyone
         tag = f"hue{hue}"
         log = self.chat_log
@@ -892,9 +1062,11 @@ class Gester:
         log.insert("end", text + "\n")
         log.config(state="disabled")
         log.see("end")
-        if not self.chat_open and not quiet:
-            self.unread += 1
-            self.update_chat_icon()
+        if not quiet and who != self.my_fp:
+            play(self.chat_receive_sound)     # plays even when the chat is minimized
+            if not self.chat_open:
+                self.unread += 1
+                self.update_chat_icon()
 
     # --- the THEMES page ---
     def make_themes_page(self):
@@ -947,7 +1119,8 @@ class Gester:
                 if value in swap:
                     c.itemconfig(item, **{option: swap[value]})
         for entry in (self.entry, self.name_entry, self.chat_entry):
-            entry.config(bg=new["panel"], fg=new["text"], insertbackground=new["text"])
+            entry.config(bg=new["panel"], fg=new["text"], insertbackground=new["text"],
+                         readonlybackground=new["panel"])
         self.chat_log.config(bg=new["panel_dark"], fg=new["text"])
         for tag in self.chat_log.tag_names():
             if tag.startswith("hue"):
