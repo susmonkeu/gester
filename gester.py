@@ -34,7 +34,7 @@ NUM_JESTERS = 6
 # Friends open the CHAT tab and click "ID" to copy theirs, then send it to you.
 # You add a line below, upload gester.py, and they can chat. Remove a line to remove them.
 ROSTER = {
-    # "3fa9c2e1b7d4": "Flug",
+    # "64ec516005f3": "Flug",
     # "9c01d5e2a8b3": "Emii",
 }
 
