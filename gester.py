@@ -35,7 +35,7 @@ NUM_JESTERS = 6
 # You add a line below, upload gester.py, and they can chat. Remove a line to remove them.
 ROSTER = {
     # "64ec516005f3": "Flug",
-    # "9c01d5e2a8b3": "Emii",
+    # "2cea0f4f79e0": "Emii",
 }
 
 # Messages containing these words are blocked (whole words only). Add your own!
