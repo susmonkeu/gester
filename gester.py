@@ -36,6 +36,7 @@ NUM_JESTERS = 6
 ROSTER = {
     "64ec516005f3": "Flug",
     "2cea0f4f79e0": "Emii",
+    "34c65519ed36": "Millana",
 }
 
 # YOUR ID: only this person gets the CLEAR button in the chat panel.
