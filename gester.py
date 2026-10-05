@@ -47,7 +47,7 @@ BLOCKED_WORDS = {"nigger", "nigga"}
 
 # AUTO-UPDATING SOUNDS: your GitHub repo as "yourname/gester" ("" = off).
 # Put your sound files in a folder called "sounds" in that repo.
-GITHUB_REPO = "https://github.com/susmonkeu/gester/tree/main/sounds"
+GITHUB_REPO = "https://github.com/susmonkeu/gester"
 
 # MULTIPLAYER: paste your Discord channel IDs here (0 = that feature is off)
 SYNC_CHANNEL_ID = 1556072377530458174      # the channel that keeps everyone's name list in sync
