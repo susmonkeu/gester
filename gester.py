@@ -36,6 +36,7 @@ NUM_JESTERS = 6
 ROSTER = {
     "64ec516005f3": "Flug",
     "2cea0f4f79e0": "Emii",
+    "34c65519ed36": "Millana",
 }
 
 # YOUR ID: only this person gets the CLEAR button in the chat panel.
@@ -55,7 +56,7 @@ CHAT_CHANNEL_ID = 1556072398111903784      # the channel the chat box uses
 BOARD_CHANNEL_ID = 1556556283266469928     # the channel the Milloku leaderboard uses
 USE_MESSAGE_CONTENT_INTENT = False   # only set True if the chat shows blank messages
 CHAT_W = 300             # how much wider the window gets when the chat is open
-VERSION = "1.10.0"          # change this each update so you can see it worked
+VERSION = "1.11.0"          # change this each update so you can see it worked
 
 HOVER_SOUND = "hover.wav"
 CLICK_SOUND = "click.wav"
@@ -532,6 +533,24 @@ def read_board(content):
         return None
 
 
+def read_leaf_score(content):
+    """Check a Leaf Sweep leaderboard message. Returns (id, level, tenths_of_a_second) or None if fake."""
+    try:
+        if not content.startswith("GESTER-LEAF "):
+            return None
+        public_hex, e_hex, s_hex, level, tenths, stamp = content[12:].split(":")
+        public = int(public_hex, 16)
+        who = fingerprint(public)
+        level, tenths, stamp = int(level), int(tenths), int(stamp)
+        if who not in ROSTER or not 1 <= level <= LEAF_LEVELS or not 30 <= tenths <= 36000:
+            return None
+        if not verify(public, f"LEAF|{level}|{tenths}|{stamp}", int(e_hex, 16), int(s_hex, 16)):
+            return None
+        return who, level, tenths
+    except Exception:
+        return None
+
+
 _LOOKALIKES = str.maketrans("@013$5", "aoiess")
 
 
@@ -687,6 +706,26 @@ def load_board():
         return {}
 
 
+LEAF_BOARD_FILE = os.path.join(HERE, "leafboard.json")
+
+
+def load_leaf_board():
+    """Best Leaf Sweep times {id: {level: tenths of a second}}."""
+    try:
+        with open(LEAF_BOARD_FILE) as f:
+            return {who: {int(k): int(v) for k, v in times.items()} for who, times in json.load(f).items()}
+    except Exception:
+        return {}
+
+
+def save_leaf_board(board):
+    try:
+        with open(LEAF_BOARD_FILE, "w") as f:
+            json.dump({who: {str(k): v for k, v in times.items()} for who, times in board.items()}, f)
+    except OSError:
+        pass
+
+
 def save_board(board):
     try:
         with open(BOARD_FILE, "w") as f:
@@ -771,6 +810,10 @@ def leaf_level(level):
     return {"count": count, "leaves": leaves, "rocks": rocks, "bin": (bx, by, bw, bh),
             "moving": moving, "bin_speed": 0.8 + max(0, level - 10) * 0.07, "wind": wind,
             "par": 10 + count * 1.1}
+
+
+def format_tenths(tenths):
+    return f"{tenths // 600}:{tenths % 600 / 10:04.1f}"
 
 
 def leaf_stars(par, seconds):
@@ -967,7 +1010,7 @@ class DiscordLink:
                 self.inbox.append(("chat_history", found[::-1]))
             if BOARD_CHANNEL_ID:
                 channel = await self.find_channel(BOARD_CHANNEL_ID)
-                found = [m.content async for m in channel.history(limit=300)]
+                found = [m.content async for m in channel.history(limit=600)]
                 self.inbox.append(("board_history", found[::-1]))
         except Exception as error:
             self.inbox.append(("error", f"Discord history error: {error}"))
@@ -1254,6 +1297,9 @@ class Gester:
         self.spinning = False
         self.bot = DiscordLink()
         self.updates = deque()           # news from the background sound updater
+        self.lboard = load_leaf_board()   # Leaf Sweep leaderboard: {id: {level: best time}}
+        self.lboard_server = {}           # what Discord has told us (so we can re-share offline wins)
+        self.board_tab = "milloku"
         self.board = load_board()        # Milloku leaderboard: {id: [levels beaten, time]}
         self.su_done = load_progress()   # sudoku levels beaten
         self.su_level = 1
@@ -1672,9 +1718,17 @@ class Gester:
                     result = read_board(content)
                     if result:
                         self.board_update(*result)
+                    leaf = read_leaf_score(content)
+                    if leaf:
+                        self.leaf_board_update(*leaf, server=True)
                 self.after_board_history()
             elif kind == "board":
                 result = read_board(data)
+                leaf = read_leaf_score(data)
+                if leaf and self.leaf_board_update(*leaf, server=True):
+                    save_leaf_board(self.lboard)
+                    if self.page == "board":
+                        self.refresh_board()
                 if result and self.board_update(*result):
                     save_board(self.board)
                     if self.page == "board":
@@ -1882,8 +1936,12 @@ class Gester:
         c = self.canvas
         self.board_title = FancyText(c, WIDTH / 2, 45, "MILLOKU LEADERBOARD", 30, "board",
                                      depth=4, shadow=True)
-        self.board_note = c.create_text(WIDTH / 2, 82, text="", fill="#8888aa",
+        self.board_note = c.create_text(WIDTH / 2, 366, text="", fill="#8888aa",
                                         font=("Helvetica", 11), tags="board")
+        self.make_button("BOARD_TAB_MILLOKU", "MILLOKU", 150, 66, 350, 96, "board",
+                         lambda: self.set_board_tab("milloku"), size=12)
+        self.make_button("BOARD_TAB_LEAF", "LEAF SWEEP", 370, 66, 570, 96, "board",
+                         lambda: self.set_board_tab("leaf"), size=12)
         self.board_rows = []
         for i in range(10):
             y = 118 + i * 26
@@ -1893,9 +1951,15 @@ class Gester:
                 "name": c.create_text(232, y, anchor="w", text="", fill="white",
                                       font=("Helvetica", 14, "bold"), tags="board"),
                 "level": c.create_text(515, y, anchor="e", text="", fill="#8888aa",
-                                       font=("Helvetica", 13), tags="board")})
+                                       font=("Helvetica", 13), tags="board"),
+                "time": c.create_text(590, y, anchor="e", text="", fill="#8888aa",
+                                      font=("Helvetica", 13), tags="board")})
         self.make_button("BOARD_BACK", "BACK", 260, 385, 460, 430, "board",
                          lambda: self.show_page("menu"), size=14)
+
+    def set_board_tab(self, tab):
+        self.board_tab = tab
+        self.refresh_board()
 
     def open_board(self):
         self.show_page("board")
@@ -1913,24 +1977,70 @@ class Gester:
 
     def refresh_board(self):
         c = self.canvas
-        # most levels first; if tied, whoever got there first
-        entries = sorted(((level, stamp, who) for who, (level, stamp) in self.board.items()
-                          if who in ROSTER and level > 0), key=lambda t: (-t[0], t[1]))
-        c.itemconfig(self.board_note, text="" if entries else "No scores yet. Beat a Milloku level to get on the board!")
+        leaf = self.board_tab == "leaf"
+        self.board_title.set_text("LEAF SWEEP BOARD" if leaf else "MILLOKU LEADERBOARD")
+        self.buttons["BOARD_TAB_MILLOKU"]["text"].set_text("MILLOKU" if leaf else "> MILLOKU <")
+        self.buttons["BOARD_TAB_LEAF"]["text"].set_text("> LEAF SWEEP <" if leaf else "LEAF SWEEP")
+        if leaf:
+            # highest level first; if tied, the quickest time on that level
+            entries = []
+            for who, times in self.lboard.items():
+                if who in ROSTER and times:
+                    top = max(times)
+                    entries.append((top, times[top], who))
+            entries.sort(key=lambda t: (-t[0], t[1]))
+            empty = "No scores yet. Clear a Leaf Sweep level to get on the board!"
+        else:
+            # most levels first; if tied, whoever got there first
+            entries = sorted(((level, stamp, who) for who, (level, stamp) in self.board.items()
+                              if who in ROSTER and level > 0), key=lambda t: (-t[0], t[1]))
+            empty = "No scores yet. Beat a Milloku level to get on the board!"
+        c.itemconfig(self.board_note, text="" if entries else empty)
         for i, row in enumerate(self.board_rows):
             if i < len(entries):
-                level, stamp, who = entries[i]
+                level, extra, who = entries[i]
                 c.itemconfig(row["rank"], text=str(i + 1))
                 c.itemconfig(row["name"], text=ROSTER[who] + ("  (you)" if who == self.my_fp else ""))
-                c.itemconfig(row["level"], text="ALL 100 DONE!" if level >= 100 else f"level {level} / 100")
+                if leaf:
+                    c.itemconfig(row["level"], text="ALL 30 CLEAR!" if level >= LEAF_LEVELS else f"level {level}")
+                    c.itemconfig(row["time"], text=format_tenths(extra))
+                else:
+                    c.itemconfig(row["level"], text="ALL 100 DONE!" if level >= 100 else f"level {level} / 100")
+                    c.itemconfig(row["time"], text="")
             else:
                 for part in row.values():
                     c.itemconfig(part, text="")
 
+    def leaf_board_update(self, who, level, tenths, server=False):
+        """Keep each player's quickest time per level. Returns True if the board changed."""
+        if server:
+            old = self.lboard_server.setdefault(who, {}).get(level)
+            if old is None or tenths < old:
+                self.lboard_server[who][level] = tenths
+        times = self.lboard.setdefault(who, {})
+        if level not in times or tenths < times[level]:
+            times[level] = tenths
+            return True
+        return False
+
+    def post_leaf_score(self, level, tenths):
+        if self.my_fp not in ROSTER or not BOARD_CHANNEL_ID:
+            return
+        stamp = int(time.time())
+        e, s = sign(self.secret, f"LEAF|{level}|{tenths}|{stamp}")
+        if self.bot.post(f"GESTER-LEAF {self.public:x}:{e:x}:{s:x}:{level}:{tenths}:{stamp}", BOARD_CHANNEL_ID):
+            self.lboard_server.setdefault(self.my_fp, {})[level] = tenths
+
     def after_board_history(self):
         save_board(self.board)
+        save_leaf_board(self.lboard)
         if self.page == "board":
             self.refresh_board()
+        mine = self.lboard.get(self.my_fp, {})                   # share Leaf Sweep times the board doesn't know about
+        known = self.lboard_server.get(self.my_fp, {})
+        for level, tenths in sorted(mine.items()):
+            if level not in known or tenths < known[level]:
+                self.post_leaf_score(level, tenths)
         if self.su_done > self.board.get(self.my_fp, [0, 0])[0]:
             self.post_score()      # share progress the board doesn't know about yet
 
@@ -2663,6 +2773,11 @@ class Gester:
         self.lf_stars[level] = max(self.lf_stars.get(level, 0), lf["stars"])
         self.lf_done = max(self.lf_done, level)
         save_leaf_progress(self.lf_done, self.lf_stars)
+        tenths = max(30, int(lf["elapsed"] * 10))
+        lf["new_best"] = self.leaf_board_update(self.my_fp, level, tenths) if self.my_fp in ROSTER else False
+        if lf["new_best"]:
+            save_leaf_board(self.lboard)
+            self.post_leaf_score(level, tenths)
         play(self.leaf_win_sound)
         for _ in range(8):
             self.ripples.append([random.randint(LF_X0, LF_X1), random.randint(LF_Y0, LF_Y1), 5])
