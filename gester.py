@@ -36,7 +36,6 @@ NUM_JESTERS = 6
 ROSTER = {
     "64ec516005f3": "Flug",
     "2cea0f4f79e0": "Emii",
-    "34c65519ed36": "Millana",
 }
 
 # YOUR ID: only this person gets the CLEAR button in the chat panel.
@@ -56,7 +55,7 @@ CHAT_CHANNEL_ID = 1556072398111903784      # the channel the chat box uses
 BOARD_CHANNEL_ID = 1556556283266469928     # the channel the Milloku leaderboard uses
 USE_MESSAGE_CONTENT_INTENT = False   # only set True if the chat shows blank messages
 CHAT_W = 300             # how much wider the window gets when the chat is open
-VERSION = "1.9.1"          # change this each update so you can see it worked
+VERSION = "1.10.0"          # change this each update so you can see it worked
 
 HOVER_SOUND = "hover.wav"
 CLICK_SOUND = "click.wav"
@@ -220,6 +219,7 @@ def make_menu_music():
 try:
     import pygame
     pygame.mixer.init()
+    pygame.mixer.set_num_channels(24)
     SOUND_ON = True
 except Exception:
     SOUND_ON = False
@@ -695,6 +695,191 @@ def save_board(board):
         pass
 
 
+# ---------- LEAF SWEEP: levels, saving and sounds ----------
+LEAF_FILE = os.path.join(HERE, "leafsweep.json")
+LEAF_LEVELS = 30
+LF_X0, LF_Y0, LF_X1, LF_Y1 = 20, 70, 628, 434      # the playing field
+LEAF_COLORS = ["#d9381e", "#e8641b", "#f2a31b", "#c8b22a", "#a8531f", "#b5302a", "#e87f24", "#8f6a1e"]
+GOLD_LEAF = "#ffd23f"
+# the outline of one leaf (tip on the right); the tip is listed twice to keep it pointy
+LEAF_SHAPE = [(1.0, 0), (1.0, 0), (0.5, 0.42), (-0.1, 0.55), (-0.75, 0.32), (-1.0, 0),
+              (-0.75, -0.32), (-0.1, -0.55), (0.5, -0.42)]
+LEAF_HINTS = {1: "Move your mouse to sweep the leaves into the bin!",
+              2: "Golden leaves are worth bonus points. Sweep leaves fast in a row for combos!",
+              4: "Rocks! Leaves bounce off them.",
+              6: "Wind! Watch for the warning at the top.",
+              10: "The bin is on the move!"}
+
+
+def load_leaf_progress():
+    """(levels cleared, {level: best stars}) from the save file."""
+    try:
+        with open(LEAF_FILE) as f:
+            data = json.load(f)
+        done = max(0, min(LEAF_LEVELS, int(data["completed"])))
+        stars = {int(k): max(1, min(3, int(v))) for k, v in data.get("stars", {}).items()}
+        return done, stars
+    except Exception:
+        return 0, {}
+
+
+def save_leaf_progress(done, stars):
+    try:
+        with open(LEAF_FILE, "w") as f:
+            json.dump({"completed": done, "stars": {str(k): v for k, v in stars.items()}}, f)
+    except OSError:
+        pass
+
+
+def leaf_level(level):
+    """Everything about a level. The same level number always gives the same level."""
+    rng = random.Random(level * 7331 + 11)
+    count = min(80, 10 + int(level * 2.4))
+    golden = min(6, 1 + level // 6)
+    bw = max(76, int(114 - level * 1.3))
+    bh = 84
+    moving = level >= 10
+    bx, by = LF_X1 - bw - 8, LF_Y1 - bh - 8
+    # the part of the field that must stay clear (the bin, or the whole bottom strip when it moves)
+    keep_x, keep_y = (LF_X0 if moving else bx - 30), by - 28
+    rocks = []
+    for _ in range(max(0, min(7, (level - 1) // 3))):
+        for _try in range(80):
+            rr = rng.randint(14, 22)
+            x, y = rng.uniform(LF_X0 + 60, LF_X1 - 60), rng.uniform(LF_Y0 + 60, LF_Y1 - 60)
+            if x + rr > keep_x and y + rr > keep_y:
+                continue
+            if all(math.hypot(x - ox, y - oy) > rr + orr + 50 for ox, oy, orr in rocks):
+                rocks.append((x, y, rr))
+                break
+    gold_ids = set(rng.sample(range(count), min(golden, count)))
+    leaves = []
+    for i in range(count):
+        for _try in range(100):
+            x, y = rng.uniform(LF_X0 + 22, LF_X1 - 22), rng.uniform(LF_Y0 + 22, LF_Y1 - 22)
+            if x > keep_x - 10 and y > keep_y - 10:
+                continue
+            if any(math.hypot(x - rx, y - ry) < rr + 22 for rx, ry, rr in rocks):
+                continue
+            break
+        leaves.append((x, y, rng.uniform(9.0, 13.0), rng.randrange(len(LEAF_COLORS)),
+                       i in gold_ids, rng.uniform(0, math.tau)))
+    wind = None
+    if level >= 6:
+        wind = {"power": min(1.0, 0.45 + (level - 6) * 0.025),          # push per frame at the peak of a gust
+                "wait": int(max(5.0, 12 - (level - 6) * 0.25) * 30)}    # frames between gusts
+    return {"count": count, "leaves": leaves, "rocks": rocks, "bin": (bx, by, bw, bh),
+            "moving": moving, "bin_speed": 0.8 + max(0, level - 10) * 0.07, "wind": wind,
+            "par": 10 + count * 1.1}
+
+
+def leaf_stars(par, seconds):
+    return 3 if seconds <= par else (2 if seconds <= par * 1.8 else 1)
+
+
+def star_points(cx, cy, r):
+    pts = []
+    for i in range(10):
+        angle = -math.pi / 2 + i * math.pi / 5
+        radius = r if i % 2 == 0 else r * 0.45
+        pts += [cx + math.cos(angle) * radius, cy + math.sin(angle) * radius]
+    return pts
+
+
+def play_at(sound, volume):
+    """Play a sound at a chosen volume (so quick sweeps sound stronger than slow ones)."""
+    if sound:
+        channel = sound.play()
+        if channel:
+            channel.set_volume(max(0.0, min(1.0, volume)))
+
+
+def write_samples(path, samples, peak=0.85, rate=22050):
+    top = max(1e-9, max(abs(v) for v in samples))
+    scale = peak / top if peak else 1.0
+    data = bytearray()
+    for v in samples:
+        data += int(max(-1.0, min(1.0, v * scale)) * 32000).to_bytes(2, "little", signed=True)
+    with wave.open(path, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(rate)
+        f.writeframes(bytes(data))
+
+
+def noise_band(ms, low, high, seed, power=1.2, crackle=0.0):
+    """A swish of filtered noise (the sound of leaves and wind)."""
+    rate = 22050
+    rnd = random.Random(seed)
+    count = int(rate * ms / 1000)
+    a_hi = 1 - math.exp(-2 * math.pi * high / rate)
+    a_lo = 1 - math.exp(-2 * math.pi * low / rate)
+    lp_hi = lp_lo = 0.0
+    gain = 1.0
+    out = []
+    for i in range(count):
+        if i % 110 == 0:
+            gain = 1.0 - crackle * rnd.random()      # crunchy flutter
+        x = rnd.uniform(-1, 1)
+        lp_hi += a_hi * (x - lp_hi)
+        lp_lo += a_lo * (x - lp_lo)
+        out.append((lp_hi - lp_lo) * math.sin(math.pi * i / count) ** power * gain)
+    return out
+
+
+def tone_events(events, ms):
+    """Soft bell-like notes. An event is (start_ms, hz, length_ms, volume, decay)."""
+    rate = 22050
+    out = [0.0] * int(rate * ms / 1000)
+    for start_ms, hz, length_ms, vol, decay in events:
+        first = int(rate * start_ms / 1000)
+        for i in range(int(rate * length_ms / 1000)):
+            if first + i >= len(out):
+                break
+            t = i / rate
+            out[first + i] += vol * (math.sin(2 * math.pi * hz * t) * math.exp(-t * decay)
+                                     + 0.3 * math.sin(4 * math.pi * hz * t) * math.exp(-t * decay * 1.7))
+    return out
+
+
+def leaf_pop(hz):
+    """The 'plop' of a leaf landing in the bin: a soft thud and a bright note."""
+    notes = tone_events([(0, hz, 220, 0.6, 16)], 220)
+    for i in range(len(notes)):
+        t = i / 22050
+        notes[i] += 0.55 * math.sin(2 * math.pi * 150 * t) * math.exp(-t * 42)
+    return notes
+
+
+LEAF_SWEEP_SOUND = "leaf_sweep.wav"        # your own sweeping sound (optional)
+LEAF_COLLECT_SOUND = "leaf_collect.wav"    # your own "leaf in the bin" sound (optional)
+LEAF_GOLD_SOUND = "leaf_gold.wav"
+LEAF_WIN_SOUND = "leaf_win.wav"
+LEAF_GUST_SOUND = "leaf_gust.wav"
+
+
+def make_leaf_sounds():
+    """Make built-in leaf sounds for any you haven't provided."""
+    jobs = {}
+    for i, (ms, lo, hi, seed) in enumerate([(170, 500, 3400, 1), (200, 700, 4300, 2), (150, 400, 2900, 3)], 1):
+        jobs[f"leaf_sweep_{i}.wav"] = lambda ms=ms, lo=lo, hi=hi, seed=seed: noise_band(ms, lo, hi, seed, 1.2, 0.7)
+    for i, hz in enumerate([523, 587, 659, 784, 880, 1047], 1):     # each combo step is a higher note
+        jobs[f"leaf_collect_{i}.wav"] = lambda hz=hz: leaf_pop(hz)
+    jobs[LEAF_GOLD_SOUND] = lambda: tone_events([(0, 1568, 300, 0.5, 9), (70, 2093, 330, 0.5, 9),
+                                                  (140, 2637, 360, 0.4, 9)], 520)
+    jobs[LEAF_WIN_SOUND] = lambda: tone_events([(0, 523, 300, 0.45, 8), (110, 659, 300, 0.45, 8),
+                                                (220, 784, 300, 0.45, 8), (330, 1047, 1000, 0.5, 4),
+                                                (330, 1319, 1000, 0.3, 4), (330, 1568, 1000, 0.25, 4)], 1400)
+    jobs[LEAF_GUST_SOUND] = lambda: noise_band(1000, 80, 700, 9, 1.0, 0.2)
+    for name, make in jobs.items():
+        if find_file(name) is None:
+            try:
+                os.makedirs(DEFAULT_DIR, exist_ok=True)
+                write_samples(os.path.join(DEFAULT_DIR, name), make())
+            except Exception:
+                pass
+
+
 # ---------- THE DISCORD BOT ----------
 try:
     import discord
@@ -1039,6 +1224,8 @@ class Gester:
                                 bg=THEME["bg"], highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", self.on_resize)
+        self.canvas.bind("<Motion>", self.on_motion)
+        self.canvas.bind("<Leave>", lambda e: setattr(self, "pointer", None))
 
         self.hue = 0.0
         self.speed = NORMAL_SPEED
@@ -1078,9 +1265,17 @@ class Gester:
         self.su_puzzle = [0] * 81
         self.su_grid = [0] * 81
         self.su_solution = [0] * 81
+        self.lf_done, self.lf_stars = load_leaf_progress()    # Leaf Sweep progress
+        self.lf_level = 1
+        self.lf = None                   # the level being played
+        self.lf_overlay = False
+        self.lf_cursor_hidden = False
+        self.leaf_win_center = (LF_X0 + LF_X1) / 2
+        self.pointer = None              # where the mouse is, in page coordinates
 
         make_default_sounds()
         make_menu_music()
+        make_leaf_sounds()
         self.load_all_sounds()
 
         # Things created first are drawn at the back, so order matters here.
@@ -1095,11 +1290,12 @@ class Gester:
         self.make_sudoku_page()
         self.make_themes_page()
         self.make_board_page()
+        self.make_leaf_page()
         self.make_chat_panel()
         self.make_wipe_bars()
         self.page_titles = {"menu": [self.options_title], "names": [self.names_title],
                             "sudoku": [self.su_title], "themes": [self.themes_title],
-                            "board": [self.board_title]}
+                            "board": [self.board_title], "leaves": [self.leaf_title]}
 
         self.status = self.canvas.create_text(
             WIDTH / 2, 455, text="Welcome to Gester!",
@@ -1130,6 +1326,13 @@ class Gester:
         self.whoosh_sound = load_sound(WHOOSH_SOUND, 0.6)
         self.chat_open_sound = load_sound(CHAT_OPEN_SOUND, 0.7)
         self.chat_close_sound = load_sound(CHAT_CLOSE_SOUND, 0.7)
+        custom = load_sound(LEAF_SWEEP_SOUND, 0.8)             # your own file wins over the built-in ones
+        self.leaf_sweeps = [custom] if custom else [load_sound(f"leaf_sweep_{i}.wav", 0.8) for i in (1, 2, 3)]
+        custom = load_sound(LEAF_COLLECT_SOUND, 0.9)
+        self.leaf_collects = [custom] if custom else [load_sound(f"leaf_collect_{i}.wav", 0.9) for i in range(1, 7)]
+        self.leaf_gold_sound = load_sound(LEAF_GOLD_SOUND, 0.8)
+        self.leaf_win_sound = load_sound(LEAF_WIN_SOUND, 0.9)
+        self.leaf_gust_sound = load_sound(LEAF_GUST_SOUND, 0.7)
 
     # --- music: loud on the main menu, quiet in the background on other pages ---
     def start_menu_music(self):
@@ -1278,6 +1481,9 @@ class Gester:
                 self.canvas.itemconfig("chat", state="hidden")
 
     # --- resizing: the pages stay centered, the background fills the whole window ---
+    def on_motion(self, event):
+        self.pointer = (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+
     def on_resize(self, event=None):
         self.layout(event.width if event else None, event.height if event else None)
 
@@ -1353,11 +1559,12 @@ class Gester:
         tools = [("NAME CHOOSER", lambda: self.show_page("names")),
                  ("MILLOKU", self.open_sudoku),
                  ("LEADERBOARD", self.open_board),
+                 ("LEAF SWEEP", self.open_leaves),
                  ("THEMES", lambda: self.show_page("themes"))]
         for i, (label, action) in enumerate(tools):
-            y1 = 118 + i * 62
-            self.make_button(label, label, 210, y1, 510, y1 + 52, "menu", action)
-        self.make_button("BACK", "BACK", 260, 385, 460, 430, "menu", self.on_back, size=14)
+            y1 = 102 + i * 56
+            self.make_button(label, label, 210, y1, 510, y1 + 46, "menu", action)
+        self.make_button("BACK", "BACK", 260, 392, 460, 436, "menu", self.on_back, size=14)
 
     # --- the NAME CHOOSER page ---
     def make_names_page(self):
@@ -1961,6 +2168,14 @@ class Gester:
             self.su_load_level(level + 1)
 
     def on_key(self, event):
+        if self.page == "leaves":
+            try:
+                typing = isinstance(self.root.focus_get(), (tk.Entry, tk.Text))
+            except KeyError:
+                typing = False
+            if event.keysym in ("r", "R") and not typing:
+                self.leaf_restart()
+            return
         if self.page != "sudoku":
             return
         try:
@@ -1979,6 +2194,505 @@ class Gester:
                 col += {"Left": -1, "Right": 1}.get(event.keysym, 0)
                 self.su_selected = (row % 9) * 9 + col % 9
             self.su_refresh()
+
+    # --- the LEAF SWEEP page ---
+    def make_leaf_page(self):
+        c, T = self.canvas, "leaves"
+        c.create_polygon(rounded(LF_X0 - 8, LF_Y0 - 8, LF_X1 + 8, LF_Y1 + 8, 16), smooth=True,
+                         fill="#10101a", outline="#333344", width=3, tags=T)
+        stripe = (LF_X1 - LF_X0) / 8
+        for i in range(8):                                   # mown-lawn stripes
+            c.create_rectangle(LF_X0 + i * stripe, LF_Y0, LF_X0 + (i + 1) * stripe, LF_Y1,
+                               fill="#161622" if i % 2 else "#10101a", outline="", tags=T)
+        self.make_button("LEAF_BACK", "BACK", 20, 12, 92, 44, T, lambda: self.show_page("menu"), size=11)
+        self.leaf_title = FancyText(c, 102, 28, "LEAF SWEEP", 16, T, depth=3, shadow=True, anchor="w")
+        self.make_button("LEAF_PREV", "<", 268, 12, 300, 44, T, lambda: self.leaf_go(-1), size=14)
+        self.make_button("LEAF_NEXT_LEVEL", ">", 420, 12, 452, 44, T, lambda: self.leaf_go(1), size=14)
+        self.leaf_label = c.create_text(360, 22, text="", fill="white", font=("Helvetica", 11, "bold"), tags=T)
+        self.leaf_info = c.create_text(360, 38, text="", fill="#8888aa", font=("Helvetica", 9), tags=T)
+        self.make_button("LEAF_RESTART", "RETRY", 460, 12, 518, 44, T, self.leaf_restart, size=10)
+        self.leaf_score = c.create_text(LF_X1, 22, anchor="e", text="", fill="white",
+                                        font=("Helvetica", 13, "bold"), tags=T)
+        self.leaf_best = c.create_text(LF_X1, 38, anchor="e", text="", fill="#6a6a88",
+                                       font=("Helvetica", 9), tags=T)
+        c.create_rectangle(LF_X0, 50, LF_X1, 60, fill="#10101a", outline="#333344", tags=T)
+        self.leaf_bar = c.create_rectangle(LF_X0 + 1, 51, LF_X0 + 1, 59, fill="#ffffff", outline="", tags=T)
+        self.leaf_streaks = [c.create_line(0, 0, 0, 0, fill="#ffffff", width=2, capstyle="round", tags=T)
+                             for _ in range(9)]
+        self.leaf_msg = c.create_text((LF_X0 + LF_X1) / 2, LF_Y0 + 28, text="", fill="#ffffff",
+                                      font=("Helvetica", 22, "bold"), tags=T)
+        # the broom (everything that moves during a level sits just under it)
+        handle = c.create_line(0, 0, 0, 0, fill="#8a5a2b", width=5, capstyle="round", tags=T)
+        head = c.create_polygon(0, 0, 0, 0, 0, 0, fill="#e0b64a", outline="#a8802a", width=2, tags=T)
+        band = c.create_line(0, 0, 0, 0, fill="#6b4a1c", width=3, capstyle="round", tags=T)
+        self.leaf_broom = [handle, head, band]
+        self.leaf_anchor = c.create_rectangle(0, 0, 0, 0, outline="", tags=T)
+
+        # the "level clear" panel
+        W, cx = "leafwin", (LF_X0 + LF_X1) / 2
+        c.create_polygon(rounded(cx - 175, 140, cx + 175, 372, 22), smooth=True, fill="#161622",
+                         outline="#333344", width=3, tags=W)
+        self.leaf_win_title = FancyText(c, cx, 180, "LEVEL CLEAR!", 26, W, depth=4, shadow=True)
+        self.leaf_win_stars = [c.create_polygon(star_points(cx + (i - 1) * 56, 232, 20), fill="#3a3a4a",
+                                                outline="#555570", width=2, tags=W) for i in range(3)]
+        self.leaf_win_info = c.create_text(cx, 274, text="", fill="white", font=("Helvetica", 12, "bold"), tags=W)
+        self.leaf_win_best = c.create_text(cx, 294, text="", fill="#8888aa", font=("Helvetica", 10), tags=W)
+        for i, (key, label, action) in enumerate([("LEAF_WIN_NEXT", "NEXT", self.leaf_next),
+                                                  ("LEAF_WIN_REPLAY", "REPLAY", self.leaf_restart),
+                                                  ("LEAF_WIN_MENU", "MENU", lambda: self.show_page("menu"))]):
+            x1 = cx - 165 + i * 113
+            self.make_button(key, label, x1, 318, x1 + 104, 354, W, action, size=11)
+        c.itemconfig(W, state="hidden")
+
+    def open_leaves(self):
+        self.lf_level = min(self.lf_done + 1, LEAF_LEVELS)
+        self.show_page("leaves")
+
+    def leaf_enter(self):
+        """The page just appeared: tidy the extras and start the level."""
+        for item in self.leaf_streaks + [self.leaf_msg]:
+            self.canvas.itemconfig(item, state="hidden")
+        self.leaf_load(self.lf_level)
+
+    def leaf_leave(self):
+        self.canvas.delete("lfdyn")
+        self.canvas.itemconfig("leafwin", state="hidden")
+        self.canvas.config(cursor="")
+        self.lf, self.lf_overlay, self.lf_cursor_hidden = None, False, False
+
+    def lf_item(self, kind, *args, **options):
+        """Make something that belongs to the current level (tidied up when the level ends)."""
+        c = self.canvas
+        item = getattr(c, "create_" + kind)(*args, tags=("leaves", "lfdyn"), **options)
+        c.tag_lower(item, self.leaf_broom[0])        # under the broom, over the lawn
+        return item
+
+    def leaf_load(self, level):
+        c = self.canvas
+        c.delete("lfdyn")
+        c.itemconfig("leafwin", state="hidden")
+        self.lf_overlay = False
+        p = leaf_level(level)
+        self.lf_level = level
+        bx, by, bw, bh = p["bin"]
+        bin_items = [
+            self.lf_item("polygon", rounded(bx + 4, by + 6, bx + bw + 4, by + bh + 6, 12), smooth=True,
+                         fill="#05050a", outline=""),
+            self.lf_item("polygon", rounded(bx, by, bx + bw, by + bh, 12), smooth=True,
+                         fill="#7a4f27", outline="#c28a4a", width=3),
+            self.lf_item("polygon", rounded(bx + 10, by + 10, bx + bw - 10, by + bh - 10, 8), smooth=True,
+                         fill="#24160a", outline="")]
+        for rx, ry, rr in p["rocks"]:
+            self.lf_item("oval", rx - rr, ry - rr, rx + rr, ry + rr, fill="#6d6d78", outline="#4a4a54", width=2)
+            self.lf_item("oval", rx - rr * 0.6, ry - rr * 0.72, rx + rr * 0.1, ry - rr * 0.1,
+                         fill="#8c8c98", outline="")
+        leaves = []
+        for x, y, s, color_index, gold, angle in p["leaves"]:
+            color = GOLD_LEAF if gold else LEAF_COLORS[color_index]
+            leaf = {"x": x, "y": y, "vx": 0.0, "vy": 0.0, "a": angle, "w": 0.0, "s": s, "gold": gold,
+                    "color": color, "state": "on", "t": 0, "sd": random.choice((-1, 1)),
+                    "body": self.lf_item("polygon", *([0, 0] * len(LEAF_SHAPE)), smooth=True, fill=color, outline=""),
+                    "rib": self.lf_item("line", 0, 0, 0, 0, fill=mix(color, "#000000", 0.4), width=1.5,
+                                        capstyle="round")}
+            self.leaf_draw(leaf)
+            leaves.append(leaf)
+        self.lf = {"p": p, "level": level, "frame": 0, "t0": time.time(), "state": "play", "score": 0,
+                   "combo": 0, "last_collect": -999, "collected": 0, "leaves": leaves, "bin": [bx, by, bw, bh],
+                   "bin_dir": 1, "bin_items": bin_items, "bin_flash": 0.0, "on": False, "bx": 0.0, "by": 0.0,
+                   "bvx": 0.0, "bvy": 0.0, "hx": 1.0, "hy": 0.0, "speed": 0.0, "samples": [], "last_sweep": -99,
+                   "wind": "idle", "wind_t": 0, "wind_dir": (1, 0), "floats": [], "bits": [], "win_t": 0,
+                   "ov_t": 0, "elapsed": 0.0, "stars": 0}
+        self.leaf_update_texts()
+        c.coords(self.leaf_bar, LF_X0 + 1, 51, LF_X0 + 1, 59)
+        c.itemconfig(self.leaf_msg, state="hidden")
+        for item in self.leaf_streaks:
+            c.itemconfig(item, state="hidden")
+        if level in LEAF_HINTS:
+            c.itemconfig(self.status, text=LEAF_HINTS[level])
+        else:
+            c.itemconfig(self.status, text=f"Level {level}: sweep all {p['count']} leaves into the bin")
+
+    def leaf_draw(self, leaf, scale=1.0):
+        c = self.canvas
+        s, x, y = leaf["s"] * scale, leaf["x"], leaf["y"]
+        cs, sn = math.cos(leaf["a"]), math.sin(leaf["a"])
+        pts = []
+        for px, py in LEAF_SHAPE:
+            pts.append(x + (px * cs - py * sn) * s)
+            pts.append(y + (px * sn + py * cs) * s)
+        c.coords(leaf["body"], *pts)
+        c.coords(leaf["rib"], x - cs * s * 0.85, y - sn * s * 0.85, x + cs * s * 0.7, y + sn * s * 0.7)
+        leaf["drawn"] = (x, y, leaf["a"], scale)
+
+    def leaf_update_texts(self):
+        lf, c = self.lf, self.canvas
+        seconds = int(lf["elapsed"] if lf["state"] == "won" else time.time() - lf["t0"])
+        c.itemconfig(self.leaf_label, text=f"LEVEL {lf['level']} / {LEAF_LEVELS}")
+        c.itemconfig(self.leaf_info, text=f"leaves {lf['collected']}/{len(lf['p']['leaves'])}   "
+                                          f"{seconds // 60}:{seconds % 60:02d}")
+        c.itemconfig(self.leaf_score, text=f"SCORE {lf['score']}")
+        best = self.lf_stars.get(lf["level"])
+        c.itemconfig(self.leaf_best, text=f"best: {best}/3 stars" if best else "not cleared yet")
+
+    def leaf_go(self, step):
+        target = self.lf_level + step
+        if target < 1 or target > LEAF_LEVELS:
+            return
+        if target > min(self.lf_done + 1, LEAF_LEVELS):
+            self.canvas.itemconfig(self.status, text=f"Clear level {self.lf_level} first!")
+            return
+        self.leaf_load(target)
+
+    def leaf_restart(self):
+        if self.page == "leaves":
+            self.leaf_load(self.lf_level)
+
+    def leaf_next(self):
+        if self.page == "leaves" and self.lf_level < LEAF_LEVELS:
+            self.leaf_load(self.lf_level + 1)
+
+    # --- the broom: follows the mouse, and pushes leaves ahead of it ---
+    def leaf_broom_update(self):
+        lf, c, ptr = self.lf, self.canvas, self.pointer
+        inside = (ptr is not None and not self.lf_overlay and LF_X0 - 14 <= ptr[0] <= LF_X1 + 14
+                  and LF_Y0 - 14 <= ptr[1] <= LF_Y1 + 14)
+        lf["samples"] = []
+        if not inside:                          # the broom is lifted off the lawn
+            lf["on"], lf["speed"], lf["bvx"], lf["bvy"] = False, 0.0, 0.0, 0.0
+            for item in self.leaf_broom:
+                c.itemconfig(item, state="hidden")
+            return
+        tx, ty = min(max(ptr[0], LF_X0 + 4), LF_X1 - 4), min(max(ptr[1], LF_Y0 + 4), LF_Y1 - 4)
+        px, py = lf["bx"], lf["by"]
+        if not lf["on"]:
+            lf["bx"], lf["by"], lf["on"] = tx, ty, True
+            px, py = tx, ty
+        else:
+            lf["bx"] += (tx - lf["bx"]) * 0.65
+            lf["by"] += (ty - lf["by"]) * 0.65
+        lf["bvx"], lf["bvy"] = lf["bx"] - px, lf["by"] - py
+        speed = math.hypot(lf["bvx"], lf["bvy"])
+        lf["speed"] = speed
+        if speed > 2:                           # the bristles turn to face where the broom is heading
+            lf["hx"] += (lf["bvx"] / speed - lf["hx"]) * 0.4
+            lf["hy"] += (lf["bvy"] / speed - lf["hy"]) * 0.4
+            size = math.hypot(lf["hx"], lf["hy"]) or 1.0
+            lf["hx"], lf["hy"] = lf["hx"] / size, lf["hy"] / size
+        steps = max(1, min(4, int(speed / 12) + 1))      # check along the path so fast flicks don't skip leaves
+        lf["samples"] = [(px + (lf["bx"] - px) * (k + 1) / steps, py + (lf["by"] - py) * (k + 1) / steps)
+                         for k in range(steps)]
+        hx, hy, bx, by = lf["hx"], lf["hy"], lf["bx"], lf["by"]
+        nx, ny = -hy, hx
+        c.coords(self.leaf_broom[0], bx + 8, by - 4, bx + 46, by - 76)
+        c.coords(self.leaf_broom[1],
+                 bx + nx * 24 + hx * 4, by + ny * 24 + hy * 4, bx - nx * 24 + hx * 4, by - ny * 24 + hy * 4,
+                 bx - nx * 24 - hx * 9, by - ny * 24 - hy * 9, bx + nx * 24 - hx * 9, by + ny * 24 - hy * 9)
+        c.coords(self.leaf_broom[2], bx + nx * 22 - hx * 3, by + ny * 22 - hy * 3,
+                 bx - nx * 22 - hx * 3, by - ny * 22 - hy * 3)
+        for item in self.leaf_broom:
+            c.itemconfig(item, state="normal")
+
+    # --- wind ---
+    def leaf_wind(self):
+        """Returns the push (ax, ay) the wind is giving the leaves this frame."""
+        lf, c = self.lf, self.canvas
+        w = lf["p"]["wind"]
+        if not w or lf["state"] != "play":
+            return 0.0, 0.0
+        lf["wind_t"] += 1
+        dx, dy = lf["wind_dir"]
+        if lf["wind"] == "idle":
+            if lf["wind_t"] >= w["wait"]:
+                lf["wind"], lf["wind_t"] = "warn", 0
+                lf["wind_dir"] = random.choice([(1, 0), (-1, 0), (0, 1), (0, -1)])
+                arrows = {(1, 0): ">>>  WIND  >>>", (-1, 0): "<<<  WIND  <<<",
+                          (0, 1): "vvv  WIND  vvv", (0, -1): "^^^  WIND  ^^^"}[lf["wind_dir"]]
+                c.itemconfig(self.leaf_msg, text=arrows, state="normal")
+            return 0.0, 0.0
+        if lf["wind"] == "warn":
+            c.itemconfig(self.leaf_msg, fill=rainbow(self.hue * 6) if lf["wind_t"] % 8 < 5 else "#ffffff")
+            if lf["wind_t"] >= 34:
+                lf["wind"], lf["wind_t"] = "gust", 0
+                play(self.leaf_gust_sound)
+            return 0.0, 0.0
+        t = lf["wind_t"]                          # a gust: builds, peaks, fades
+        profile = math.sin(math.pi * min(1.0, t / 50))
+        color = mix(THEME["panel_dark"], "#ffffff", 0.5)
+        span = (LF_X1 - LF_X0, LF_Y1 - LF_Y0)
+        for k, streak in enumerate(self.leaf_streaks):
+            if dx:
+                lane = LF_Y0 + 24 + (k + 0.5) * (span[1] - 48) / len(self.leaf_streaks)
+                u = (t * 24 + k * 83) % (span[0] + 120) - 60
+                head = LF_X0 + u if dx > 0 else LF_X1 - u
+                tail = head - dx * 55
+                x1, x2 = min(max(head, LF_X0), LF_X1), min(max(tail, LF_X0), LF_X1)
+                coords, length = (x1, lane, x2, lane), abs(x1 - x2)
+            else:
+                lane = LF_X0 + 24 + (k + 0.5) * (span[0] - 48) / len(self.leaf_streaks)
+                u = (t * 24 + k * 83) % (span[1] + 120) - 60
+                head = LF_Y0 + u if dy > 0 else LF_Y1 - u
+                tail = head - dy * 55
+                y1, y2 = min(max(head, LF_Y0), LF_Y1), min(max(tail, LF_Y0), LF_Y1)
+                coords, length = (lane, y1, lane, y2), abs(y1 - y2)
+            c.coords(streak, *coords)
+            c.itemconfig(streak, fill=color, state="normal" if length > 3 else "hidden")
+        if t >= 50:
+            lf["wind"], lf["wind_t"] = "idle", 0
+            c.itemconfig(self.leaf_msg, state="hidden")
+            for streak in self.leaf_streaks:
+                c.itemconfig(streak, state="hidden")
+        power = lf["p"]["wind"]["power"] * profile
+        return dx * power, dy * power
+
+    # --- one frame of the game ---
+    def leaf_tick(self):
+        lf, c = self.lf, self.canvas
+        lf["frame"] += 1
+        f, state = lf["frame"], lf["state"]
+        self.leaf_broom_update()
+
+        # the cursor hides while you are sweeping (the broom replaces it)
+        want_hidden = bool(self.pointer and not self.lf_overlay and self.hovered is None
+                           and LF_X0 - 6 <= self.pointer[0] <= LF_X1 + 6 and LF_Y0 - 6 <= self.pointer[1] <= LF_Y1 + 6)
+        if want_hidden != self.lf_cursor_hidden:
+            self.lf_cursor_hidden = want_hidden
+            c.config(cursor="none" if want_hidden else "")
+
+        # the bin slides along the bottom on later levels
+        bx, by, bw, bh = lf["bin"]
+        if lf["p"]["moving"] and state == "play":
+            nxt = bx + lf["bin_dir"] * lf["p"]["bin_speed"]
+            lo, hi = LF_X0 + 6, LF_X1 - bw - 6
+            if nxt < lo or nxt > hi:
+                lf["bin_dir"] *= -1
+                nxt = min(max(nxt, lo), hi)
+            for item in lf["bin_items"]:
+                c.move(item, nxt - bx, 0)
+            lf["bin"][0] = bx = nxt
+        zone = (bx + 9, by + 9, bx + bw - 9, by + bh - 9)
+        flash = lf["bin_flash"]
+        lf["bin_flash"] = flash * 0.8 if flash > 0.03 else 0.0
+        if flash or lf["bin_flash"]:
+            c.itemconfig(lf["bin_items"][2], fill=mix("#24160a", "#ffcf6e", flash * 0.55))
+            c.itemconfig(lf["bin_items"][1], outline=mix("#c28a4a", "#ffffff", flash * 0.6))
+
+        ax, ay = self.leaf_wind()
+        samples = lf["samples"] if (lf["on"] and state == "play") else []
+        speed = lf["speed"]
+        hx, hy = lf["hx"], lf["hy"]
+        nx, ny = -hy, hx
+        bvx, bvy = lf["bvx"], lf["bvy"]
+        if speed > 38:                           # cap the broom's push (a huge flick shouldn't launch leaves)
+            bvx, bvy = bvx * 38 / speed, bvy * 38 / speed
+        pushed = 0
+        finished = []
+        for leaf in lf["leaves"]:
+            if leaf["state"] == "in":            # sinking into the bin
+                leaf["t"] += 1
+                leaf["x"] += ((zone[0] + zone[2]) / 2 - leaf["x"]) * 0.35
+                leaf["y"] += ((zone[1] + zone[3]) / 2 - leaf["y"]) * 0.35
+                self.leaf_draw(leaf, max(0.05, 1 - leaf["t"] / 8))
+                if leaf["t"] >= 8:
+                    finished.append(leaf)
+                continue
+            if ax or ay:
+                leaf["vx"] += ax * (0.5 + 0.5 * math.sin(leaf["a"] * 3 + leaf["x"] * 0.01) ** 2)
+                leaf["vy"] += ay * (0.5 + 0.5 * math.sin(leaf["a"] * 3 + leaf["y"] * 0.01) ** 2)
+            for sx, sy in samples:
+                lx, ly = leaf["x"] - sx, leaf["y"] - sy
+                if abs(lx) > 60 or abs(ly) > 60:
+                    continue
+                along, across = lx * nx + ly * ny, lx * hx + ly * hy      # where the leaf is, relative to the blade
+                off = along - max(-24, min(24, along))
+                dist = math.hypot(off, across)
+                reach = 15 + leaf["s"] * 0.55
+                if dist >= reach:
+                    continue
+                if dist < 0.001:
+                    ox, oy = hx, hy
+                else:
+                    ox, oy = (off * nx + across * hx) / dist, (off * ny + across * hy) / dist
+                k = 1.0 - dist / reach
+                if speed > 1.5:
+                    if across > -9:              # only what is in front of the bristles gets swept
+                        pull = 0.55 + 0.4 * k
+                        leaf["vx"] += (bvx * 1.12 - leaf["vx"]) * pull + ox * speed * 0.07
+                        leaf["vy"] += (bvy * 1.12 - leaf["vy"]) * pull + oy * speed * 0.07
+                        leaf["w"] += (random.random() - 0.5) * 0.5
+                        pushed += 1
+                        if speed > 12 and random.random() < 0.05:
+                            self.leaf_burst(leaf["x"], leaf["y"], leaf["color"], 1, 2.0)
+                        break
+                else:                            # the broom is resting on it: just ease the leaf aside
+                    leaf["vx"] += ox * 0.8 * k
+                    leaf["vy"] += oy * 0.8 * k
+                    break
+            leaf["vx"] *= 0.915
+            leaf["vy"] *= 0.915
+            sp = math.hypot(leaf["vx"], leaf["vy"])
+            if sp > 26:
+                leaf["vx"], leaf["vy"], sp = leaf["vx"] * 26 / sp, leaf["vy"] * 26 / sp, 26.0
+            if sp > 0.15:
+                leaf["x"] += leaf["vx"]
+                leaf["y"] += leaf["vy"]
+                leaf["a"] += leaf["w"] + sp * 0.025 * leaf["sd"]
+                leaf["w"] *= 0.9
+                r = leaf["s"] * 0.6
+                if leaf["x"] < LF_X0 + r:
+                    leaf["x"], leaf["vx"] = LF_X0 + r, abs(leaf["vx"]) * 0.5
+                elif leaf["x"] > LF_X1 - r:
+                    leaf["x"], leaf["vx"] = LF_X1 - r, -abs(leaf["vx"]) * 0.5
+                if leaf["y"] < LF_Y0 + r:
+                    leaf["y"], leaf["vy"] = LF_Y0 + r, abs(leaf["vy"]) * 0.5
+                elif leaf["y"] > LF_Y1 - r:
+                    leaf["y"], leaf["vy"] = LF_Y1 - r, -abs(leaf["vy"]) * 0.5
+                for rx, ry, rr in lf["p"]["rocks"]:       # bounce off the rocks
+                    dx, dy = leaf["x"] - rx, leaf["y"] - ry
+                    d = math.hypot(dx, dy)
+                    if d < rr + r:
+                        d = d or 1.0
+                        ox, oy = dx / d, dy / d
+                        leaf["x"], leaf["y"] = rx + ox * (rr + r), ry + oy * (rr + r)
+                        dot = leaf["vx"] * ox + leaf["vy"] * oy
+                        if dot < 0:
+                            leaf["vx"] -= 1.5 * dot * ox
+                            leaf["vy"] -= 1.5 * dot * oy
+                            leaf["w"] += (random.random() - 0.5) * 0.4
+            else:
+                leaf["vx"] = leaf["vy"] = 0.0
+            if (state == "play" and leaf["state"] == "on"          # in the bin (even if it was resting there)
+                    and zone[0] <= leaf["x"] <= zone[2] and zone[1] <= leaf["y"] <= zone[3]):
+                self.leaf_collect(leaf)
+            drawn = leaf.get("drawn")
+            if leaf["state"] == "on" and (drawn is None or abs(drawn[0] - leaf["x"]) > 0.04
+                                          or abs(drawn[1] - leaf["y"]) > 0.04 or abs(drawn[2] - leaf["a"]) > 0.002):
+                self.leaf_draw(leaf)
+            if leaf["gold"] and leaf["state"] == "on" and f % 3 == 0:     # golden leaves glitter
+                c.itemconfig(leaf["body"], fill=mix(GOLD_LEAF, "#ffffff", 0.55 * (0.5 + 0.5 * math.sin(f * 0.4 + leaf["a"]))))
+
+        for leaf in finished:
+            c.delete(leaf["body"], leaf["rib"])
+            lf["leaves"].remove(leaf)
+            lf["collected"] += 1
+            self.leaf_update_texts()
+            if lf["collected"] >= len(lf["p"]["leaves"]) and lf["state"] == "play":
+                self.leaf_win()
+
+        if pushed and speed > 4 and f - lf["last_sweep"] >= 5:        # the rustle of sweeping
+            lf["last_sweep"] = f
+            play_at(random.choice(self.leaf_sweeps), min(1.0, 0.25 + speed / 28) * min(1.0, 0.45 + pushed * 0.12))
+
+        for fl in lf["floats"][:]:                                    # "+20 x3" pop-ups
+            fl["life"] -= 1
+            fl["y"] -= 1.5
+            c.coords(fl["item"], fl["x"], fl["y"])
+            c.itemconfig(fl["item"], fill=mix(fl["color"], THEME["panel_dark"], 1 - fl["life"] / 30))
+            if fl["life"] <= 0:
+                c.delete(fl["item"])
+                lf["floats"].remove(fl)
+        for bit in lf["bits"][:]:                                     # flying specks
+            bit["life"] -= 1
+            bit["x"] += bit["vx"]
+            bit["y"] += bit["vy"]
+            bit["vy"] += 0.18
+            bit["vx"] *= 0.97
+            size = max(0.5, bit["size"] * bit["life"] / bit["max"])
+            c.coords(bit["item"], bit["x"] - size, bit["y"] - size, bit["x"] + size, bit["y"] + size)
+            if bit["life"] <= 0 or bit["y"] > LF_Y1 + 20:
+                c.delete(bit["item"])
+                lf["bits"].remove(bit)
+
+        total = max(1, len(lf["p"]["leaves"]))
+        c.coords(self.leaf_bar, LF_X0 + 1, 51, LF_X0 + 1 + (LF_X1 - LF_X0 - 2) * lf["collected"] / total, 59)
+        c.itemconfig(self.leaf_bar, fill=rainbow(self.hue * 2))
+        if f % 6 == 0 and state == "play":
+            self.leaf_update_texts()
+
+        if state == "won":
+            lf["win_t"] += 1
+            if lf["win_t"] == 26:
+                self.leaf_show_overlay()
+        if self.lf_overlay:
+            lf["ov_t"] += 1
+            self.leaf_win_title.paint(rainbow(self.hue * 3))
+            for i in range(lf["stars"]):          # the stars pop in one by one
+                if lf["ov_t"] == 6 + i * 8:
+                    c.itemconfig(self.leaf_win_stars[i], fill="#ffcc33", outline="#fff2b0")
+                    play(self.leaf_collects[min(i * 2 + 1, len(self.leaf_collects) - 1)])
+                    self.ripples.append([self.leaf_win_center + (i - 1) * 56, 232, 5])
+
+    # --- scoring ---
+    def leaf_collect(self, leaf):
+        lf, c = self.lf, self.canvas
+        leaf["state"], leaf["t"] = "in", 0
+        lf["combo"] = lf["combo"] + 1 if lf["frame"] - lf["last_collect"] <= 22 else 1
+        lf["last_collect"] = lf["frame"]
+        combo = lf["combo"]
+        points = 10 * min(combo, 8) + (50 if leaf["gold"] else 0)
+        lf["score"] += points
+        lf["bin_flash"] = 1.0
+        play(self.leaf_collects[min(combo - 1, len(self.leaf_collects) - 1)])
+        if leaf["gold"]:
+            play(self.leaf_gold_sound)
+        bx, by, bw, bh = lf["bin"]
+        text = f"+{points}" + (f"  x{combo}" if combo >= 3 else "")
+        item = self.lf_item("text", bx + bw / 2, by - 6, text=text, fill="#ffffff",
+                            font=("Helvetica", 12 + min(combo, 6), "bold"))
+        lf["floats"].append({"item": item, "x": bx + bw / 2, "y": by - 6, "life": 30,
+                             "color": GOLD_LEAF if (leaf["gold"] or combo >= 3) else "#ffffff"})
+        self.leaf_burst(bx + bw / 2, by + bh / 2, leaf["color"], 6 if not leaf["gold"] else 12, 3.2)
+
+    def leaf_burst(self, x, y, color, count, power):
+        lf = self.lf
+        for _ in range(count):
+            if len(lf["bits"]) >= 80:
+                return
+            angle, speed = random.uniform(0, math.tau), random.uniform(0.4, 1.0) * power
+            size = random.uniform(2.0, 3.6)
+            life = random.randint(14, 24)
+            item = self.lf_item("oval", x, y, x + 1, y + 1, fill=color, outline="")
+            lf["bits"].append({"item": item, "x": x, "y": y, "vx": math.cos(angle) * speed,
+                               "vy": math.sin(angle) * speed - 1.2, "life": life, "max": life, "size": size})
+
+    def leaf_win(self):
+        lf = self.lf
+        lf["state"], lf["win_t"] = "won", 0
+        lf["elapsed"] = time.time() - lf["t0"]
+        lf["stars"] = leaf_stars(lf["p"]["par"], lf["elapsed"])
+        level = lf["level"]
+        self.lf_stars[level] = max(self.lf_stars.get(level, 0), lf["stars"])
+        self.lf_done = max(self.lf_done, level)
+        save_leaf_progress(self.lf_done, self.lf_stars)
+        play(self.leaf_win_sound)
+        for _ in range(8):
+            self.ripples.append([random.randint(LF_X0, LF_X1), random.randint(LF_Y0, LF_Y1), 5])
+        for _ in range(34):                       # leaves rain down
+            x = random.uniform(LF_X0, LF_X1)
+            self.leaf_burst(x, LF_Y0 + 4, random.choice(LEAF_COLORS + [GOLD_LEAF]), 1, 1.0)
+        self.canvas.itemconfig(self.status, text=f"Level {level} clear! {lf['stars']} star{'s' if lf['stars'] != 1 else ''}")
+        if level % 10 == 0:                       # tell the server about milestones
+            self.bot.post(f"\U0001F342 **{self.username}** just cleared Leaf Sweep level {level}!",
+                          getattr(self.bot, "channel_id", 0))
+
+    def leaf_show_overlay(self):
+        lf, c = self.lf, self.canvas
+        self.lf_overlay = True
+        self.leaf_win_center = (LF_X0 + LF_X1) / 2
+        c.itemconfig("leafwin", state="normal")
+        last = lf["level"] >= LEAF_LEVELS
+        self.leaf_win_title.set_text("ALL CLEAR!!!" if last else "LEVEL CLEAR!")
+        for item in self.buttons["LEAF_WIN_NEXT"]["items"]:
+            c.itemconfig(item, state="hidden" if last else "normal")
+        for item in self.leaf_win_stars:
+            c.itemconfig(item, fill="#3a3a4a", outline="#555570")
+        seconds = int(lf["elapsed"])
+        c.itemconfig(self.leaf_win_info, text=f"time {seconds // 60}:{seconds % 60:02d}   •   score {lf['score']}")
+        par = int(lf["p"]["par"])
+        c.itemconfig(self.leaf_win_best, text=f"3 stars if under {par // 60}:{par % 60:02d}")
+        for key in ("LEAF_WIN_NEXT", "LEAF_WIN_REPLAY", "LEAF_WIN_MENU"):    # the buttons pop in
+            b = self.buttons[key]
+            b["scale"], b["kick"], b["sig"] = 0.5, 0.0, None
+        lf["ov_t"] = 0
 
     # --- the SPIN animation ---
     def spin(self):
@@ -2050,7 +2764,8 @@ class Gester:
         """Hover = grow, glow and shine. Click = pop bigger and flash. Only redraws what changed."""
         for key, b in self.buttons.items():
             page = b["page"]
-            if not (page == self.page or page == "chaticon" or (page == "chat" and self.chat_open)):
+            if not (page == self.page or page == "chaticon" or (page == "chat" and self.chat_open)
+                    or (page == "leafwin" and self.lf_overlay)):
                 continue
             hovered = key == self.hovered
             b["kick"] *= 0.8
@@ -2161,10 +2876,15 @@ class Gester:
 
     def _apply_page(self, name):
         """Show one page and hide the others."""
+        was_leaves = self.page == "leaves"
         self.page = name
-        for page in ("home", "menu", "names", "sudoku", "themes", "board"):
+        for page in ("home", "menu", "names", "sudoku", "themes", "board", "leaves"):
             self.canvas.itemconfig(page, state="normal" if page == name else "hidden")
         self.clear_hover()
+        if was_leaves and name != "leaves":
+            self.leaf_leave()
+        if name == "leaves":
+            self.leaf_enter()
         if name == "names":
             self.entry.focus_set()
         else:
@@ -2283,6 +3003,8 @@ class Gester:
                         self.canvas.itemconfig(row[part], fill=rainbow(self.hue * 2 + i * 0.15))
 
         self.animate_buttons()
+        if self.page == "leaves" and self.lf:
+            self.leaf_tick()
 
         # sudoku page: rainbow title and lines, glowing selected square, victory rainbow
         if self.page == "sudoku":
