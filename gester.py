@@ -56,7 +56,7 @@ CHAT_CHANNEL_ID = 1556072398111903784      # the channel the chat box uses
 BOARD_CHANNEL_ID = 1556556283266469928     # the channel the Milloku leaderboard uses
 USE_MESSAGE_CONTENT_INTENT = False   # only set True if the chat shows blank messages
 CHAT_W = 300             # how much wider the window gets when the chat is open
-VERSION = "1.13.0"          # change this each update so you can see it worked
+VERSION = "1.14.0"          # change this each update so you can see it worked
 
 HOVER_SOUND = "hover.wav"
 CLICK_SOUND = "click.wav"
@@ -1002,6 +1002,90 @@ def make_leaf_sounds():
                 pass
 
 
+# ---------- EMIISWEEPER: boards, saving and sounds ----------
+EMII_FILE = os.path.join(HERE, "emiisweeper.json")
+# name: (columns, rows, mines, size of one square)
+EMII_MODES = {"EASY": (9, 9, 10, 38), "MED": (16, 11, 32, 32), "HARD": (22, 13, 62, 27)}
+EMII_NUM_COLORS = {1: "#5aa9ff", 2: "#5ee08a", 3: "#ff6b6b", 4: "#c58bff", 5: "#ff9f5a",
+                   6: "#4fe0d8", 7: "#ffffff", 8: "#a0a0b8"}
+EMII_HINT = "Left click digs, right click flags (or use FLAG)."
+
+
+def load_emii():
+    """{'best': {mode: tenths of a second}, 'wins': {mode: count}} from the save file."""
+    try:
+        with open(EMII_FILE) as f:
+            data = json.load(f)
+        return {"best": {k: int(v) for k, v in data.get("best", {}).items() if k in EMII_MODES},
+                "wins": {k: int(v) for k, v in data.get("wins", {}).items() if k in EMII_MODES}}
+    except Exception:
+        return {"best": {}, "wins": {}}
+
+
+def save_emii(data):
+    try:
+        with open(EMII_FILE, "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
+def emii_neighbors(cols, rows, i):
+    r, c = divmod(i, cols)
+    return [(r + dr) * cols + (c + dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1)
+            if (dr or dc) and 0 <= r + dr < rows and 0 <= c + dc < cols]
+
+
+def emii_layout(cols, rows, mines, safe):
+    """Place the mines (never on the first square you click, or around it when there is room)."""
+    total = cols * rows
+    banned = {safe} | set(emii_neighbors(cols, rows, safe))
+    if total - len(banned) < mines:
+        banned = {safe}
+    spots = random.sample([i for i in range(total) if i not in banned], mines)
+    mine = [False] * total
+    for i in spots:
+        mine[i] = True
+    nums = [sum(mine[n] for n in emii_neighbors(cols, rows, i)) for i in range(total)]
+    return mine, nums
+
+
+def fmt_seconds(seconds):
+    seconds = int(seconds)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+EMII_POP_SOUND = "emii_pop.wav"
+EMII_FLAG_SOUND = "emii_flag.wav"
+EMII_UNFLAG_SOUND = "emii_unflag.wav"
+EMII_BOOM_SOUND = "emii_boom.wav"
+EMII_WIN_SOUND = "emii_win.wav"
+EMII_REVEAL_SOUND = "emii_reveal.wav"
+
+
+def make_emii_sounds():
+    """Make built-in Emiisweeper sounds for any you haven't provided."""
+    jobs = {}
+    for i, hz in enumerate([620, 700, 790, 890, 1000], 1):         # a dug square, climbing for each ring of a cascade
+        jobs[f"emii_reveal_{i}.wav"] = lambda hz=hz: tone_events([(0, hz, 100, 0.6, 38), (0, hz * 2, 60, 0.15, 60)], 100)
+    jobs[EMII_FLAG_SOUND] = lambda: tone_events([(0, 520, 70, 0.6, 32), (50, 780, 110, 0.6, 26)], 170)
+    jobs[EMII_UNFLAG_SOUND] = lambda: tone_sweep(700, 330, 110, 16)
+    jobs[EMII_POP_SOUND] = lambda: [a * 0.8 + b * 0.6 for a, b in zip(noise_band(240, 120, 1800, 8, 0.8, 0.5),
+                                                                        tone_sweep(320, 70, 240, 12))]
+    jobs[EMII_BOOM_SOUND] = lambda: [a * 0.8 + b for a, b in zip(noise_band(1000, 40, 900, 7, 0.6, 0.3),
+                                                                  tone_sweep(150, 35, 1000, 3.2))]
+    jobs[EMII_WIN_SOUND] = lambda: tone_events([(0, 523, 260, 0.45, 8), (100, 659, 260, 0.45, 8), (200, 784, 260, 0.45, 8),
+                                                (300, 1047, 260, 0.45, 8), (420, 1319, 1100, 0.5, 3.5),
+                                                (420, 1047, 1100, 0.3, 3.5), (420, 784, 1100, 0.25, 3.5)], 1600)
+    for name, make in jobs.items():
+        if find_file(name) is None:
+            try:
+                os.makedirs(DEFAULT_DIR, exist_ok=True)
+                write_samples(os.path.join(DEFAULT_DIR, name), make())
+            except Exception:
+                pass
+
+
 # ---------- THE DISCORD BOT ----------
 try:
     import discord
@@ -1347,6 +1431,10 @@ class Gester:
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", self.on_resize)
         self.canvas.bind("<Motion>", self.on_motion)
+        self.canvas.bind("<Button-1>", lambda e: self.em_mouse(e, "left"), add="+")        # Emiisweeper
+        self.canvas.bind("<Button-3>", lambda e: self.em_mouse(e, "flag"), add="+")
+        mac = self.root.tk.call("tk", "windowingsystem") == "aqua"
+        self.canvas.bind("<Button-2>", lambda e: self.em_mouse(e, "flag" if mac else "mid"), add="+")
         self.canvas.bind("<Leave>", lambda e: setattr(self, "pointer", None))
 
         self.hue = 0.0
@@ -1379,6 +1467,10 @@ class Gester:
         self.lboard = load_leaf_board()   # Leaf Sweep leaderboard: {id: {level: best time}}
         self.lboard_server = {}           # what Discord has told us (so we can re-share offline wins)
         self.board_tab = "milloku"
+        self.em = None                    # the Emiisweeper game being played
+        self.em_mode = "EASY"
+        self.em_flag_mode = False
+        self.em_save = load_emii()
         self.board = load_board()        # Milloku leaderboard: {id: [levels beaten, time]}
         self.su_done = load_progress()   # sudoku levels beaten
         self.su_level = 1
@@ -1401,6 +1493,7 @@ class Gester:
         make_default_sounds()
         make_menu_music()
         make_leaf_sounds()
+        make_emii_sounds()
         self.load_all_sounds()
 
         # Things created first are drawn at the back, so order matters here.
@@ -1416,11 +1509,13 @@ class Gester:
         self.make_themes_page()
         self.make_board_page()
         self.make_leaf_page()
+        self.make_emii_page()
         self.make_chat_panel()
         self.make_wipe_bars()
         self.page_titles = {"menu": [self.options_title], "names": [self.names_title],
                             "sudoku": [self.su_title], "themes": [self.themes_title],
-                            "board": [self.board_title], "leaves": [self.leaf_title]}
+                            "board": [self.board_title], "leaves": [self.leaf_title],
+                            "emii": [self.em_title]}
 
         self.status = self.canvas.create_text(
             WIDTH / 2, 455, text="Welcome to Gester!",
@@ -1461,6 +1556,13 @@ class Gester:
         self.leaf_bump_sound = load_sound(LEAF_BUMP_SOUND, 0.8)
         self.leaf_portal_sound = load_sound(LEAF_PORTAL_SOUND, 0.7)
         self.leaf_mud_sound = load_sound(LEAF_MUD_SOUND, 0.7)
+        custom = load_sound(EMII_REVEAL_SOUND, 0.8)
+        self.em_reveals = [custom] if custom else [load_sound(f"emii_reveal_{i}.wav", 0.8) for i in range(1, 6)]
+        self.em_flag_sound = load_sound(EMII_FLAG_SOUND, 0.8)
+        self.em_unflag_sound = load_sound(EMII_UNFLAG_SOUND, 0.7)
+        self.em_pop_sound = load_sound(EMII_POP_SOUND, 0.6)
+        self.em_boom_sound = load_sound(EMII_BOOM_SOUND, 0.9)
+        self.em_win_sound = load_sound(EMII_WIN_SOUND, 0.9)
 
     # --- music: loud on the main menu, quiet in the background on other pages ---
     def start_menu_music(self):
@@ -1688,10 +1790,11 @@ class Gester:
                  ("MILLOKU", self.open_sudoku),
                  ("LEADERBOARD", self.open_board),
                  ("LEAF SWEEP", self.open_leaves),
+                 ("EMIISWEEPER", self.open_emii),
                  ("THEMES", lambda: self.show_page("themes"))]
         for i, (label, action) in enumerate(tools):
-            y1 = 102 + i * 56
-            self.make_button(label, label, 210, y1, 510, y1 + 46, "menu", action)
+            y1 = 94 + i * 49
+            self.make_button(label, label, 210, y1, 510, y1 + 41, "menu", action, size=15)
         self.make_button("BACK", "BACK", 260, 392, 460, 436, "menu", self.on_back, size=14)
 
     # --- the NAME CHOOSER page ---
@@ -2235,6 +2338,13 @@ class Gester:
             x1, y1 = 435 + col * 58, 172 + row * 58
             self.make_button(f"SU_N{d}", str(d), x1, y1, x1 + 50, y1 + 50, "sudoku",
                              lambda n=d: self.su_place(n), size=18)
+        self.su_cross = {}        # a red cross over a number once all nine of it are on the board
+        for d in range(1, 10):
+            row, col = divmod(d - 1, 3)
+            x1, y1 = 435 + col * 58, 172 + row * 58
+            self.su_cross[d] = (c.create_line(0, 0, 0, 0, fill="#ff6b6b", width=3, capstyle="round", tags="sudoku"),
+                                c.create_line(0, 0, 0, 0, fill="#ff6b6b", width=3, capstyle="round", tags="sudoku"),
+                                (x1, y1))
         self.make_button("SU_HINT", "HINT (3)", 435, 352, 601, 386, "sudoku", self.su_hint, size=12)
         self.make_button("SU_BACK", "BACK", 435, 396, 601, 430, "sudoku",
                          lambda: self.show_page("menu"), size=12)
@@ -2285,6 +2395,19 @@ class Gester:
             c.itemconfig(self.su_cells[i], fill=fill, outline=THEME["grid"], width=1)
             color = THEME["given"] if self.su_puzzle[i] else rainbow(value / 9, 0.7, 1.0)
             c.itemconfig(self.su_texts[i], text=str(value) if value else "", fill=color)
+        for d in range(1, 10):                          # a number that is used up is greyed out and crossed
+            used = sum(1 for v in self.su_grid if v == d) >= 9
+            button = self.buttons[f"SU_N{d}"]
+            if bool(button.get("dim")) != used:
+                button["dim"] = used
+                button["sig"] = None
+            a, b, (x1, y1) = self.su_cross[d]
+            if used:
+                c.coords(a, x1 + 14, y1 + 14, x1 + 36, y1 + 36)
+                c.coords(b, x1 + 36, y1 + 14, x1 + 14, y1 + 36)
+            else:
+                c.coords(a, 0, 0, 0, 0)
+                c.coords(b, 0, 0, 0, 0)
         self.su_update_info()
 
     def su_update_info(self):
@@ -2298,6 +2421,9 @@ class Gester:
     def su_place(self, digit):
         i = self.su_selected
         if self.su_won or i is None or self.su_grid[i] != 0:
+            return
+        if sum(1 for v in self.su_grid if v == digit) >= 9:
+            self.canvas.itemconfig(self.status, text=f"All nine {digit}s are already placed")
             return
         if digit == self.su_solution[i]:
             self.su_grid[i] = digit
@@ -2360,6 +2486,16 @@ class Gester:
             self.su_load_level(level + 1)
 
     def on_key(self, event):
+        if self.page == "emii":
+            try:
+                typing = isinstance(self.root.focus_get(), (tk.Entry, tk.Text))
+            except KeyError:
+                typing = False
+            if event.keysym in ("r", "R") and not typing:
+                self.em_new()
+            elif event.keysym in ("f", "F") and not typing:
+                self.em_toggle_flag_mode()
+            return
         if self.page == "leaves":
             try:
                 typing = isinstance(self.root.focus_get(), (tk.Entry, tk.Text))
@@ -3127,6 +3263,426 @@ class Gester:
             b["scale"], b["kick"], b["sig"] = 0.5, 0.0, None
         lf["ov_t"] = 0
 
+    # --- the EMIISWEEPER page ---
+    def make_emii_page(self):
+        c, T = self.canvas, "emii"
+        c.create_polygon(rounded(LF_X0 - 8, LF_Y0 - 8, LF_X1 + 8, LF_Y1 + 8, 16), smooth=True,
+                         fill="#10101a", outline="#333344", width=3, tags=T)
+        self.make_button("EM_BACK", "BACK", 20, 12, 84, 44, T, lambda: self.show_page("menu"), size=11)
+        self.em_title = FancyText(c, 90, 28, "EMIISWEEPER", 12, T, depth=3, shadow=True, anchor="w")
+        for mode, x1 in (("EASY", 238), ("MED", 296), ("HARD", 354)):
+            self.make_button(f"EM_{mode}", mode, x1, 12, x1 + 54, 44, T, lambda m=mode: self.em_new(m), size=10)
+        self.make_button("EM_NEW", "NEW", 414, 12, 462, 44, T, self.em_new, size=10)
+        self.em_mines_text = c.create_text(LF_X1, 22, anchor="e", text="", fill="white",
+                                           font=("Helvetica", 13, "bold"), tags=T)
+        self.em_time_text = c.create_text(LF_X1, 38, anchor="e", text="", fill="#8888aa",
+                                          font=("Helvetica", 9), tags=T)
+        c.create_rectangle(LF_X0, 50, LF_X1, 60, fill="#10101a", outline="#333344", tags=T)
+        self.em_bar = c.create_rectangle(LF_X0 + 1, 51, LF_X0 + 1, 59, fill="#ffffff", outline="", tags=T)
+        self.make_button("EM_FLAG", "FLAG: OFF", 528, 442, 628, 468, T, self.em_toggle_flag_mode, size=9)
+
+    def open_emii(self):
+        self.show_page("emii")
+
+    def em_enter(self):
+        self.em_flag_mode = False
+        self.buttons["EM_FLAG"]["text"].set_text("FLAG: OFF")
+        self.em_new()
+        self.canvas.itemconfig(self.status, text=EMII_HINT)
+
+    def em_leave(self):
+        self.canvas.delete("emdyn")
+        self.em = None
+
+    def em_toggle_flag_mode(self):
+        self.em_flag_mode = not self.em_flag_mode
+        self.buttons["EM_FLAG"]["text"].set_text("FLAG: ON" if self.em_flag_mode else "FLAG: OFF")
+        self.buttons["EM_FLAG"]["sel"] = self.em_flag_mode
+
+    def em_item(self, kind, *args, **options):
+        return getattr(self.canvas, "create_" + kind)(*args, tags=("emii", "emdyn"), **options)
+
+    def em_new(self, mode=None):
+        c = self.canvas
+        if mode:
+            self.em_mode = mode
+        mode = self.em_mode
+        cols, rows, mines, cs = EMII_MODES[mode]
+        c.delete("emdyn")
+        x0 = LF_X0 + (LF_X1 - LF_X0 - cols * cs) / 2
+        y0 = LF_Y0 + (LF_Y1 - LF_Y0 - rows * cs) / 2
+        cells = []
+        for i in range(cols * rows):
+            r, col = divmod(i, cols)
+            x, y = x0 + col * cs, y0 + r * cs
+            rect = self.em_item("rectangle", x + 1, y + 1, x + cs - 1, y + cs - 1, fill="#222233", outline="#111118")
+            hi = self.em_item("line", x + 2, y + cs - 3, x + 2, y + 2, x + cs - 3, y + 2, fill="#ffffff", width=2)
+            lo = self.em_item("line", x + cs - 2, y + 3, x + cs - 2, y + cs - 2, x + 3, y + cs - 2, fill="#000000", width=2)
+            txt = self.em_item("text", x + cs / 2, y + cs / 2, text="", fill="white",
+                               font=("Helvetica", int(cs * 0.5), "bold"))
+            cells.append({"rect": rect, "hi": hi, "lo": lo, "txt": txt, "x": x, "y": y, "vis": "hidden", "extra": [],
+                          "flag": []})
+        total = cols * rows
+        self.em = {"mode": mode, "cols": cols, "rows": rows, "mines": mines, "cs": cs, "x0": x0, "y0": y0,
+                   "cells": cells, "mine": [False] * total, "num": [0] * total, "rev": [False] * total,
+                   "flag": [False] * total, "first": True, "over": False, "won": False, "t0": None,
+                   "elapsed": 0.0, "pending": [], "cleared": 0, "shown": 0, "frame": 0, "fx": {}, "boom": [],
+                   "bits": [], "hover": None, "win_t": 0, "flags": 0, "banner": None, "won_pending": False,
+                   "pops": 0}
+        for i in range(total):
+            self.em_paint(i)
+        for m in EMII_MODES:
+            self.buttons[f"EM_{m}"]["sel"] = (m == mode)
+        self.buttons["EM_FLAG"]["sel"] = self.em_flag_mode
+        self.em_update_texts()
+        c.coords(self.em_bar, LF_X0 + 1, 51, LF_X0 + 1, 59)
+
+    # drawing one square
+    def em_paint(self, i):
+        em, c = self.em, self.canvas
+        cell = em["cells"][i]
+        if cell["vis"] == "open":
+            n = em["num"][i]
+            c.itemconfig(cell["rect"], fill=mix(THEME["panel_dark"], "#000000", 0.28), outline=THEME["grid"])
+            c.itemconfig(cell["hi"], state="hidden")
+            c.itemconfig(cell["lo"], state="hidden")
+            c.itemconfig(cell["txt"], text=str(n) if n else "", fill=EMII_NUM_COLORS.get(n, "#ffffff"))
+        else:
+            hover = em["hover"] == i and not em["over"]
+            face = mix(THEME["panel_hi"], "#ffffff", 0.07 + (0.1 if hover else 0.0))
+            c.itemconfig(cell["rect"], fill=face, outline=mix(face, "#000000", 0.5))
+            c.itemconfig(cell["hi"], fill=mix(face, "#ffffff", 0.45), state="normal")
+            c.itemconfig(cell["lo"], fill=mix(face, "#000000", 0.55), state="normal")
+            c.itemconfig(cell["txt"], text="")
+
+    def em_clear(self, cell, key):
+        for item in cell[key]:
+            self.canvas.delete(item)
+        cell[key] = []
+
+    def em_draw_flag(self, i, on):
+        em = self.em
+        cell = em["cells"][i]
+        self.em_clear(cell, "flag")
+        if not on:
+            return
+        x, y, cs = cell["x"], cell["y"], em["cs"]
+        cx = x + cs / 2
+        cell["flag"] = [
+            self.em_item("line", cx - cs * 0.05, y + cs * 0.2, cx - cs * 0.05, y + cs * 0.78, fill="#e8e8f0", width=2),
+            self.em_item("polygon", cx - cs * 0.05, y + cs * 0.2, cx + cs * 0.28, y + cs * 0.34, cx - cs * 0.05, y + cs * 0.48,
+                         fill="#ff4d5e", outline="#a02030"),
+            self.em_item("line", cx - cs * 0.22, y + cs * 0.8, cx + cs * 0.14, y + cs * 0.8, fill="#e8e8f0", width=3)]
+
+    def em_draw_mine(self, i, exploded=False):
+        em = self.em
+        cell = em["cells"][i]
+        self.em_clear(cell, "extra")
+        x, y, cs = cell["x"], cell["y"], em["cs"]
+        cx, cy, r = x + cs / 2, y + cs / 2, cs * 0.2
+        if exploded:
+            self.canvas.itemconfig(cell["rect"], fill="#b02a2a", outline="#ff8080")
+        else:
+            self.canvas.itemconfig(cell["rect"], fill=mix(THEME["panel_dark"], "#000000", 0.28), outline=THEME["grid"])
+        self.canvas.itemconfig(cell["hi"], state="hidden")
+        self.canvas.itemconfig(cell["lo"], state="hidden")
+        parts = []
+        for k in range(4):
+            a = k * math.pi / 4
+            parts.append(self.em_item("line", cx - math.cos(a) * r * 1.6, cy - math.sin(a) * r * 1.6,
+                                      cx + math.cos(a) * r * 1.6, cy + math.sin(a) * r * 1.6, fill="#d8d8e8", width=2))
+        parts.append(self.em_item("oval", cx - r, cy - r, cx + r, cy + r, fill="#15151c", outline="#d8d8e8", width=2))
+        parts.append(self.em_item("oval", cx - r * 0.55, cy - r * 0.6, cx - r * 0.1, cy - r * 0.15, fill="#ffffff", outline=""))
+        cell["extra"] = parts
+
+    def em_cell_at(self, x, y):
+        em = self.em
+        col, row = int((x - em["x0"]) // em["cs"]), int((y - em["y0"]) // em["cs"])
+        if x < em["x0"] or y < em["y0"] or not (0 <= col < em["cols"] and 0 <= row < em["rows"]):
+            return None
+        return row * em["cols"] + col
+
+    def em_center(self, i):
+        cell = self.em["cells"][i]
+        return cell["x"] + self.em["cs"] / 2, cell["y"] + self.em["cs"] / 2
+
+    def em_update_texts(self):
+        em, c = self.em, self.canvas
+        seconds = em["elapsed"] if em["over"] else ((time.time() - em["t0"]) if em["t0"] else 0)
+        best = self.em_save["best"].get(em["mode"])
+        c.itemconfig(self.em_mines_text, text=f"MINES {em['mines'] - em['flags']}")
+        c.itemconfig(self.em_time_text, text=f"{fmt_seconds(seconds)}   best {format_tenths(best) if best else '--'}")
+
+    # the mouse
+    def em_mouse(self, event, kind):
+        if self.page != "emii" or not self.em or self.transition or self.hovered is not None:
+            return
+        i = self.em_cell_at(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if i is None:
+            return
+        if kind == "left" and (self.em_flag_mode or event.state & 0x4):
+            kind = "flag"
+        if kind == "flag":
+            self.em_flag(i)
+        elif kind == "mid":
+            if self.em["rev"][i]:
+                self.em_chord(i)
+        else:
+            x, y = self.em_center(i)
+            self.ripples.append([x, y, 22])
+            self.em_click(i)
+
+    def em_flag(self, i):
+        em = self.em
+        if em["over"] or em["rev"][i]:
+            return
+        em["flag"][i] = not em["flag"][i]
+        em["flags"] += 1 if em["flag"][i] else -1
+        self.em_draw_flag(i, em["flag"][i])
+        play(self.em_flag_sound if em["flag"][i] else self.em_unflag_sound)
+        self.em_update_texts()
+
+    def em_click(self, i):
+        em = self.em
+        if em["over"] or em["flag"][i]:
+            return
+        if em["rev"][i]:
+            self.em_chord(i)
+            return
+        if em["first"]:
+            em["mine"], em["num"] = emii_layout(em["cols"], em["rows"], em["mines"], i)
+            em["first"], em["t0"] = False, time.time()
+        if em["mine"][i]:
+            self.em_lose(i)
+        else:
+            self.em_reveal(i)
+
+    def em_chord(self, i):
+        """Click a number whose flags are all placed: dig every other square around it."""
+        em = self.em
+        if em["over"] or em["num"][i] == 0:
+            return
+        near = emii_neighbors(em["cols"], em["rows"], i)
+        if sum(em["flag"][n] for n in near) != em["num"][i]:
+            play(self.em_unflag_sound)
+            self.canvas.itemconfig(self.status, text="Plant exactly that many flags around the number first")
+            return
+        for n in near:
+            if em["over"]:
+                break
+            if not em["rev"][n] and not em["flag"][n]:
+                if em["mine"][n]:
+                    self.em_lose(n)
+                else:
+                    self.em_reveal(n)
+
+    def em_reveal(self, start):
+        """Dig a square. A zero spreads outward in rings, each ring a beat later."""
+        em = self.em
+        order = [(start, 0)]
+        em["rev"][start] = True
+        k = 0
+        while k < len(order):
+            cur, d = order[k]
+            k += 1
+            if em["num"][cur] == 0:
+                for n in emii_neighbors(em["cols"], em["rows"], cur):
+                    if not em["rev"][n] and not em["flag"][n] and not em["mine"][n]:
+                        em["rev"][n] = True
+                        order.append((n, d + 1))
+        for cell, d in order:
+            em["pending"].append((em["frame"] + d * 2, cell, d))
+        em["cleared"] += len(order)
+        if em["cleared"] >= em["cols"] * em["rows"] - em["mines"]:
+            em["won_pending"] = True
+
+    def em_banner(self, text, color, sub=""):
+        em, c = self.em, self.canvas
+        if em["banner"]:
+            for item in em["banner"]["items"]:
+                c.delete(item)
+        cx, cy = (LF_X0 + LF_X1) / 2, (LF_Y0 + LF_Y1) / 2
+        items = [self.em_item("text", cx + 3, cy + 3, text=text, fill="#000000", font=("Helvetica", 44, "bold")),
+                 self.em_item("text", cx, cy, text=text, fill=color, font=("Helvetica", 44, "bold")),
+                 self.em_item("text", cx, cy + 46, text=sub, fill="#ffffff", font=("Helvetica", 16, "bold"))]
+        em["banner"] = {"items": items, "t": 0, "color": color, "y": cy}
+
+    def em_bit(self, x, y, color, power=3.0):
+        em = self.em
+        if len(em["bits"]) > 90:
+            return
+        angle, speed = random.uniform(0, math.tau), random.uniform(0.4, 1.0) * power
+        size, life = random.uniform(2.0, 3.6), random.randint(14, 26)
+        em["bits"].append({"item": self.em_item("oval", x, y, x + 1, y + 1, fill=color, outline=""), "x": x, "y": y,
+                           "vx": math.cos(angle) * speed, "vy": math.sin(angle) * speed - 1.0, "life": life,
+                           "max": life, "size": size})
+
+    def em_lose(self, hit):
+        em = self.em
+        em["over"], em["won"] = True, False
+        em["elapsed"] = (time.time() - em["t0"]) if em["t0"] else 0.0
+        hx, hy = self.em_center(hit)
+        mines = [i for i in range(em["cols"] * em["rows"]) if em["mine"][i] and (i == hit or not em["flag"][i])]
+        mines.sort(key=lambda i: (i != hit, math.hypot(self.em_center(i)[0] - hx, self.em_center(i)[1] - hy)))
+        for k, i in enumerate(mines):
+            em["boom"].append((em["frame"] + min(k * 2, 60), i, i == hit))
+        play(self.em_boom_sound)
+        self.em_banner("BOOM!", "#ff5a5a", "click NEW to try again")
+        self.canvas.itemconfig(self.status, text="BOOM! You hit a mine. Click NEW to try again.")
+        self.em_update_texts()
+
+    def em_win(self):
+        em = self.em
+        em["won_pending"], em["over"], em["won"] = False, True, True
+        em["elapsed"] = time.time() - em["t0"]
+        for i in range(em["cols"] * em["rows"]):          # every mine gets a flag
+            if em["mine"][i] and not em["flag"][i]:
+                em["flag"][i] = True
+                self.em_draw_flag(i, True)
+        em["flags"] = em["mines"]
+        tenths = max(10, int(em["elapsed"] * 10))
+        mode, save = em["mode"], self.em_save
+        new_best = mode not in save["best"] or tenths < save["best"][mode]
+        if new_best:
+            save["best"][mode] = tenths
+        save["wins"][mode] = save["wins"].get(mode, 0) + 1
+        save_emii(save)
+        play(self.em_win_sound)
+        for _ in range(10):
+            self.ripples.append([random.randint(LF_X0, LF_X1), random.randint(LF_Y0, LF_Y1), 5])
+        self.em_banner("YOU WIN!", "#ffd23f", ("NEW BEST!  " if new_best else "") + format_tenths(tenths))
+        self.canvas.itemconfig(self.status, text=f"Cleared {mode} in {format_tenths(tenths)}"
+                                                 + ("  -  a new best!" if new_best else ""))
+        self.em_update_texts()
+
+    # one animation step
+    def em_tick(self):
+        em, c = self.em, self.canvas
+        em["frame"] += 1
+        f = em["frame"]
+        accent = rainbow(self.hue * 3)
+
+        # squares appear (a cascade spreads in rings, each ring a little higher in pitch)
+        if em["pending"]:
+            due = [p for p in em["pending"] if p[0] <= f]
+            if due:
+                em["pending"] = [p for p in em["pending"] if p[0] > f]
+                for _, i, d in due:
+                    cell = em["cells"][i]
+                    if em["flag"][i]:
+                        em["flag"][i] = False
+                        em["flags"] -= 1
+                        self.em_draw_flag(i, False)
+                    cell["vis"] = "open"
+                    self.em_paint(i)
+                    em["fx"][i] = 1.0
+                    em["shown"] += 1
+                    if d > 0 and random.random() < 0.15:
+                        x, y = self.em_center(i)
+                        self.em_bit(x, y, accent, 2.0)
+                play(self.em_reveals[min(len(self.em_reveals) - 1, max(d for _, _, d in due) // 2)])
+                self.em_update_texts()
+        if em["won_pending"] and not em["pending"] and not em["over"]:
+            self.em_win()
+
+        # the pop of a freshly opened square
+        for i in list(em["fx"]):
+            t = em["fx"][i] * 0.74
+            cell = em["cells"][i]
+            if t < 0.05 or em["won"]:
+                del em["fx"][i]
+                if not em["won"]:
+                    self.em_paint(i)
+                continue
+            em["fx"][i] = t
+            c.itemconfig(cell["rect"], fill=mix(mix(THEME["panel_dark"], "#000000", 0.28), accent, t * 0.7))
+
+        # mines blowing up, one after another
+        if em["boom"]:
+            for entry in [b for b in em["boom"] if b[0] <= f]:
+                em["boom"].remove(entry)
+                _, i, is_hit = entry
+                self.em_draw_flag(i, False)
+                self.em_draw_mine(i, exploded=is_hit)
+                x, y = self.em_center(i)
+                self.ripples.append([x, y, 10])
+                for _ in range(5):
+                    self.em_bit(x, y, random.choice(["#ff8a30", "#ffd27a", "#ff5a5a"]), 4.0)
+                em["pops"] += 1
+                if not is_hit and em["pops"] % 2 == 0:
+                    play(self.em_pop_sound)
+            if not em["boom"]:                                   # then show the flags that were wrong
+                for i in range(em["cols"] * em["rows"]):
+                    if em["flag"][i] and not em["mine"][i]:
+                        x, y = em["cells"][i]["x"], em["cells"][i]["y"]
+                        s = em["cs"]
+                        em["cells"][i]["extra"] += [
+                            self.em_item("line", x + 5, y + 5, x + s - 5, y + s - 5, fill="#ff3030", width=3),
+                            self.em_item("line", x + s - 5, y + 5, x + 5, y + s - 5, fill="#ff3030", width=3)]
+
+        # flying specks
+        for bit in em["bits"][:]:
+            bit["life"] -= 1
+            bit["x"] += bit["vx"]
+            bit["y"] += bit["vy"]
+            bit["vy"] += 0.2
+            size = max(0.5, bit["size"] * bit["life"] / bit["max"])
+            c.coords(bit["item"], bit["x"] - size, bit["y"] - size, bit["x"] + size, bit["y"] + size)
+            if bit["life"] <= 0:
+                c.delete(bit["item"])
+                em["bits"].remove(bit)
+
+        # victory: a rainbow wave rolls across the board
+        if em["won"] and em["win_t"] < 110:
+            em["win_t"] += 1
+            if em["win_t"] % 2 == 0:
+                base = mix(THEME["panel_dark"], "#000000", 0.28)
+                strength = 0.55 if em["win_t"] < 90 else 0.55 * (110 - em["win_t"]) / 20
+                for i, cell in enumerate(em["cells"]):
+                    if cell["vis"] == "open":
+                        r, col = divmod(i, em["cols"])
+                        c.itemconfig(cell["rect"], fill=mix(base, rainbow((col + r) * 0.035 - em["win_t"] * 0.02), strength))
+            if em["win_t"] % 9 == 0:
+                self.ripples.append([random.randint(LF_X0, LF_X1), random.randint(LF_Y0, LF_Y1), 5])
+
+        # the big message
+        b = em["banner"]
+        if b:
+            b["t"] += 1
+            t = b["t"]
+            if t > 110:
+                for item in b["items"]:
+                    c.delete(item)
+                em["banner"] = None
+            else:
+                fade = min(1.0, t / 8) * (1.0 if t < 80 else max(0.0, 1 - (t - 80) / 30))
+                bg = THEME["panel_dark"]
+                y = b["y"] - min(t, 20) * 0.5
+                cx = (LF_X0 + LF_X1) / 2
+                for item, dx, dy in zip(b["items"], (3, 0, 0), (3, 0, 46)):
+                    c.coords(item, cx + dx, y + dy)
+                col = rainbow(self.hue * 4) if em["won"] else b["color"]
+                c.itemconfig(b["items"][0], fill=mix(bg, "#000000", fade))
+                c.itemconfig(b["items"][1], fill=mix(bg, col, fade))
+                c.itemconfig(b["items"][2], fill=mix(bg, "#ffffff", fade))
+
+        # the square under the mouse lights up
+        if not em["over"]:
+            ptr = self.pointer
+            hover = self.em_cell_at(*ptr) if (ptr and self.hovered is None) else None
+            if hover != em["hover"]:
+                old, em["hover"] = em["hover"], hover
+                for i in (old, hover):
+                    if i is not None and em["cells"][i]["vis"] == "hidden":
+                        self.em_paint(i)
+
+        # numbers at the top
+        total = em["cols"] * em["rows"] - em["mines"]
+        c.coords(self.em_bar, LF_X0 + 1, 51, LF_X0 + 1 + (LF_X1 - LF_X0 - 2) * em["shown"] / max(1, total), 59)
+        c.itemconfig(self.em_bar, fill=rainbow(self.hue * 2))
+        if f % 6 == 0 and not em["over"]:
+            self.em_update_texts()
+
     # --- the SPIN animation ---
     def spin(self):
         if self.spinning:
@@ -3206,7 +3762,8 @@ class Gester:
             b["scale"] += ((1.05 if hovered else 1.0) - b["scale"]) * 0.3
             scale = b["scale"] + b["kick"]
             signature = (hovered, self.theme_name, self.unread if key == "CHATICON" else 0,
-                         self.muted if key == "MUTE" else 0)
+                         self.muted if key == "MUTE" else 0, bool(b.get("dim")), bool(b.get("sel")),
+                         int(self.hue * 40) if b.get("sel") else 0)
             if hovered or b["flash"] or signature != b["sig"] or abs(scale - b["shown"]) > 0.002:
                 self.paint_button(key, b, hovered, scale)
                 b["sig"], b["shown"] = signature, scale
@@ -3218,7 +3775,12 @@ class Gester:
         half_w, half_h, r = (x2 - x1) / 2 * scale, (y2 - y1) / 2 * scale, radius * scale
         left, top, right, bottom = cx - half_w, cy - half_h, cx + half_w, cy + half_h
         accent = rainbow(self.hue * 3)
+        dim, picked = bool(b.get("dim")), bool(b.get("sel"))
+        if dim:
+            hovered = False
         fill = THEME["panel_hi"] if hovered else THEME["panel"]
+        if dim:
+            fill = mix(THEME["panel"], THEME["bg"], 0.55)
         if b["flash"]:
             fill = mix(fill, accent, b["flash"] * 0.5)
         c.coords(b["shadow"], *rounded(left + 2, top + 5, right + 2, bottom + 5, r))
@@ -3255,6 +3817,10 @@ class Gester:
             face = mix(THEME["text"], accent, 0.35)
         else:
             face = THEME["text"]
+        if dim:
+            face = THEME["faint"]
+        elif picked and not hovered:
+            face = accent
         text.paint(face)
         if b.get("icon"):
             self.paint_icon(b["icon"], cx, cy, scale, face)
@@ -3309,15 +3875,19 @@ class Gester:
 
     def _apply_page(self, name):
         """Show one page and hide the others."""
-        was_leaves = self.page == "leaves"
+        was_leaves, was_emii = self.page == "leaves", self.page == "emii"
         self.page = name
-        for page in ("home", "menu", "names", "sudoku", "themes", "board", "leaves"):
+        for page in ("home", "menu", "names", "sudoku", "themes", "board", "leaves", "emii"):
             self.canvas.itemconfig(page, state="normal" if page == name else "hidden")
         self.clear_hover()
         if was_leaves and name != "leaves":
             self.leaf_leave()
+        if was_emii and name != "emii":
+            self.em_leave()
         if name == "leaves":
             self.leaf_enter()
+        if name == "emii":
+            self.em_enter()
         if name == "names":
             self.entry.focus_set()
         else:
@@ -3438,6 +4008,8 @@ class Gester:
         self.animate_buttons()
         if self.page == "leaves" and self.lf:
             self.leaf_tick()
+        if self.page == "emii" and self.em:
+            self.em_tick()
 
         # sudoku page: rainbow title and lines, glowing selected square, victory rainbow
         if self.page == "sudoku":
