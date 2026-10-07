@@ -56,7 +56,15 @@ CHAT_CHANNEL_ID = 1556072398111903784      # the channel the chat box uses
 BOARD_CHANNEL_ID = 1556556283266469928     # the channel the Milloku leaderboard uses
 USE_MESSAGE_CONTENT_INTENT = False   # only set True if the chat shows blank messages
 CHAT_W = 300             # how much wider the window gets when the chat is open
-VERSION = "1.14.0"          # change this each update so you can see it worked
+VERSION = "1.16.0"          # change this each update so you can see it worked
+# THE PATCH NOTES: after an update, a sticky note shows these once. Every update gets an entry
+# here (the same number as VERSION above); keep each line short and friendly.
+PATCH_NOTES = {
+    "1.16.0": [
+        "NEW: patch notes! A sticky note like this pops up once after every update to tell you what changed. Click the version number in the corner to read it again.",
+        "NEW: every theme has its own menu song. Switch themes and the music fades over to match.",
+    ],
+}
 
 HOVER_SOUND = "hover.wav"
 CLICK_SOUND = "click.wav"
@@ -69,6 +77,9 @@ WHOOSH_SOUND = "page_whoosh.wav"           # plays when you change pages
 CHAT_OPEN_SOUND = "chat_open.wav"          # plays when the chat slides open
 CHAT_CLOSE_SOUND = "chat_close.wav"        # ...and when it closes
 MENU_MUSIC = "menu_music.mp3"              # main menu music (a built-in tune plays if this is missing)
+# Each theme can have its own menu song: menu_music_rainbow.mp3, menu_music_emii.mp3,
+# menu_music_millana.mp3 and menu_music_flug.mp3 (.ogg and .wav work too). A theme without its own
+# song plays menu_music.mp3, and if that is missing the built-in tune.
 MENU_VOLUME = 0.7                          # main menu music volume
 MENU_MUFFLED = 0.18                        # how quiet it gets on other pages
 INTRO_FRAMES = 84                          # how long the intro lasts (about 2.5 seconds)
@@ -88,6 +99,16 @@ BUNDLE = getattr(sys, "_MEIPASS", HERE)
 DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Gester")
 SYNC_DIR = os.path.join(DATA_DIR, "sounds")
 DEFAULT_DIR = os.path.join(DATA_DIR, "defaults")   # built-in beeps, used if a sound is missing
+
+
+def menu_music_path(theme_name):
+    """The menu song for a theme: its own file, else menu_music.*, else the built-in tune."""
+    for stem in (f"menu_music_{theme_name.lower()}", "menu_music"):
+        for ext in (".mp3", ".ogg", ".wav"):
+            path = find_file(stem + ext)
+            if path:
+                return path
+    return find_file("menu_music_default.wav")
 
 
 def find_file(filename):
@@ -871,6 +892,38 @@ def leaf_level(level):
             "par": (10 + count * 1.1) * (1.3 if level > 30 else 1.0)}
 
 
+PATCH_FILE = os.path.join(HERE, "patchnotes.json")
+
+
+def load_seen_version():
+    try:
+        with open(PATCH_FILE) as f:
+            return json.load(f).get("seen", "")
+    except Exception:
+        return ""
+
+
+def save_seen_version(version):
+    try:
+        with open(PATCH_FILE, "w") as f:
+            json.dump({"seen": version}, f)
+    except OSError:
+        pass
+
+
+def wrap_note(text, width=33):
+    """Split a patch note into short lines (the first has a dash, the rest are indented)."""
+    words, lines, line = text.split(), [], ""
+    for word in words:
+        if len(line) + len(word) + 1 > width and line:
+            lines.append(line)
+            line = word
+        else:
+            line = (line + " " + word).strip()
+    lines.append(line)
+    return ["- " + lines[0]] + ["  " + extra for extra in lines[1:]]
+
+
 def format_tenths(tenths):
     return f"{tenths // 600}:{tenths % 600 / 10:04.1f}"
 
@@ -1452,6 +1505,8 @@ class Gester:
         self.seen_ids = set()    # chat message IDs we've shown (stops copy-pasted repeats)
         self.muted = load_muted()
         self.music_mode = None       # None, "menu" or "party"
+        self.music_path = None       # the menu song that is playing
+        self.music_swap = False      # true while the old menu song fades out for a new theme's song
         self.music_vol = 0.0
         self.intro_frame = 0
         self.intro_done = False
@@ -1510,6 +1565,8 @@ class Gester:
         self.make_board_page()
         self.make_leaf_page()
         self.make_emii_page()
+        self.make_button("PATCH_OK", "GOT IT!", WIDTH / 2 - 62, 372, WIDTH / 2 + 62, 406, "patch", self.close_patch_notes, size=13)
+        self.canvas.itemconfig("patch", state="hidden")
         self.make_chat_panel()
         self.make_wipe_bars()
         self.page_titles = {"menu": [self.options_title], "names": [self.names_title],
@@ -1521,8 +1578,12 @@ class Gester:
             WIDTH / 2, 455, text="Welcome to Gester!",
             fill="#8888aa", font=("Helvetica", 12))
 
-        self.canvas.create_text(WIDTH - 10, HEIGHT - 8, anchor="se", text=f"v{VERSION}",
-                                fill="#444460", font=("Helvetica", 9))
+        version_label = self.canvas.create_text(WIDTH - 10, HEIGHT - 8, anchor="se", text=f"v{VERSION}",
+                                                fill="#444460", font=("Helvetica", 9))
+        self.canvas.tag_bind(version_label, "<Button-1>", lambda e: self.show_patch_notes())   # click to read the patch notes
+        self.canvas.tag_bind(version_label, "<Enter>", lambda e: self.canvas.config(cursor="hand2"))
+        self.canvas.tag_bind(version_label, "<Leave>", lambda e: self.canvas.config(cursor=""))
+        self.patch = None                 # the open patch-notes sticky note
 
         threading.Thread(target=sync_sounds, args=(self.updates,), daemon=True).start()
         self.theme_name = load_theme_name()
@@ -1566,18 +1627,25 @@ class Gester:
 
     # --- music: loud on the main menu, quiet in the background on other pages ---
     def start_menu_music(self):
-        path = find_file(MENU_MUSIC) or find_file("menu_music_default.wav")
+        path = menu_music_path(self.theme_name)
         if SOUND_ON and path:
             try:
                 pygame.mixer.music.load(path)
                 pygame.mixer.music.set_volume(0.0)
                 pygame.mixer.music.play(-1)
-                self.music_mode, self.music_vol = "menu", 0.0
+                self.music_mode, self.music_vol, self.music_path = "menu", 0.0, path
             except Exception:
                 pass
 
     def update_music(self):
         if not SOUND_ON or self.music_mode is None:
+            return
+        if self.music_swap:                      # fade the old song out, then start the new theme's song
+            self.music_vol *= 0.8
+            pygame.mixer.music.set_volume(max(0.0, self.music_vol))
+            if self.music_vol < 0.02:
+                self.music_swap = False
+                self.start_menu_music()
             return
         if self.muted:
             target = 0.0
@@ -1588,6 +1656,11 @@ class Gester:
         if abs(target - self.music_vol) > 0.003:      # glide to the new volume
             self.music_vol += (target - self.music_vol) * 0.07
             pygame.mixer.music.set_volume(max(0.0, min(1.0, self.music_vol)))
+
+    def swap_menu_music(self):
+        """A new theme was picked: if it has a different menu song, fade over to it."""
+        if SOUND_ON and self.music_mode == "menu" and menu_music_path(self.theme_name) != self.music_path:
+            self.music_swap = True
 
     def toggle_mute(self):
         self.muted = not self.muted
@@ -1645,6 +1718,8 @@ class Gester:
         c.config(bg=THEME["bg"])
         if self.music_mode is None:
             self.start_menu_music()
+        if PATCH_NOTES.get(VERSION) and load_seen_version() != VERSION:     # first launch after an update
+            self.root.after(700, lambda: self.show_patch_notes(first_time=True))
 
     def skip_intro(self):
         if not self.intro_done:
@@ -2276,6 +2351,7 @@ class Gester:
         for jester in self.jesters:      # jesters, minions, cats or aliens
             jester.set_style(THEME["critter"])
         save_theme(name)
+        self.swap_menu_music()
         self.update_theme_labels()
         self.su_refresh()
         self.canvas.itemconfig(self.status, text=f"Theme: {name}")
@@ -2486,6 +2562,10 @@ class Gester:
             self.su_load_level(level + 1)
 
     def on_key(self, event):
+        if self.patch:
+            if event.keysym in ("Return", "Escape", "space"):
+                self.close_patch_notes()
+            return
         if self.page == "emii":
             try:
                 typing = isinstance(self.root.focus_get(), (tk.Entry, tk.Text))
@@ -3683,6 +3763,88 @@ class Gester:
         if f % 6 == 0 and not em["over"]:
             self.em_update_texts()
 
+    # --- the PATCH NOTES sticky note ---
+    def show_patch_notes(self, first_time=False):
+        notes = PATCH_NOTES.get(VERSION)
+        if not notes or self.patch or self.transition or self.page not in ("home", "menu"):
+            return
+        if first_time:
+            save_seen_version(VERSION)       # only show it by itself once
+        c = self.canvas
+        lines_per_note = [wrap_note(n) for n in notes]
+        count = sum(len(x) for x in lines_per_note)
+        w, bottom = 330, 418
+        h = max(250, 118 + count * 16 + len(notes) * 9 + 52)
+        top = bottom - h
+        cx, cy = WIDTH / 2, (top + bottom) / 2
+        theta = -0.04                                            # the note sits a little crooked
+        cos, sin = math.cos(theta), math.sin(theta)
+
+        def put(x, y):                                           # a point on the note -> where it is on screen
+            return cx + x * cos - y * sin, cy + x * sin + y * cos
+
+        def flat(points):
+            return [v for p in points for v in put(*p)]
+        hw, hh, fold = w / 2, h / 2, 38
+        outline = [(-hw, -hh), (hw, -hh), (hw, hh - fold), (hw - fold, hh), (-hw, hh)]
+        items = []
+
+        def add(kind, *args, **options):
+            item = getattr(c, "create_" + kind)(*args, tags=("patch", "patchdyn"), **options)
+            items.append(item)
+            return item
+        add("polygon", flat([(x + 7, y + 10) for x, y in outline]), fill="#05050a", outline="")           # shadow
+        add("polygon", flat(outline), fill="#ffe66d", outline="#e0c030", width=2)                          # paper
+        add("polygon", flat([(-hw + 4, hh - 70), (hw - 4, hh - 70), (hw - 4, hh - fold - 2), (hw - fold - 2, hh - 4),
+                             (-hw + 4, hh - 4)]), fill="#fbdc55", outline="")                              # darker lower part
+        add("polygon", flat([(hw, hh - fold), (hw - fold, hh), (hw - fold, hh - fold)]), fill="#d9b73a",
+            outline="#c9a52a")                                                                             # folded corner
+        add("polygon", flat([(-48, -hh - 12), (48, -hh - 12), (48, -hh + 16), (-48, -hh + 16)]), fill="#efe8c8",
+            outline="#d4cba0")                                                                             # tape
+        angle = -math.degrees(theta)
+        x, y = put(-hw + 24, -hh + 30)
+        add("text", x, y, text="WHAT'S NEW!", anchor="w", angle=angle, fill="#3a2e0a", font=("Helvetica", 18, "bold"))
+        x, y = put(-hw + 24, -hh + 54)
+        add("text", x, y, text=f"version {VERSION}", anchor="w", angle=angle, fill="#8a6f1a", font=("Helvetica", 10, "bold"))
+        line_y = -hh + 78
+        for lines in lines_per_note:
+            for text in lines:
+                x, y = put(-hw + 24, line_y)
+                add("text", x, y, text=text, anchor="w", angle=angle, fill="#3a2e0a", font=("Helvetica", 11))
+                line_y += 16
+            line_y += 9
+        for item in items:
+            c.move(item, 0, -420)                                # starts above the window and drops in
+        self.patch = {"t": 0, "items": items, "dy": -420}
+        for item in self.buttons["PATCH_OK"]["items"]:
+            c.tag_raise(item)
+        play(self.chat_open_sound)
+
+    def patch_tick(self):
+        p, c = self.patch, self.canvas
+        p["t"] += 1
+        t = p["t"]
+        dy = -420 * (1 - bounce(min(1.0, t / 30)))
+        if abs(dy - p["dy"]) > 0.01:
+            for item in p["items"]:
+                c.move(item, 0, dy - p["dy"])
+            p["dy"] = dy
+        if t == 22:                                           # the button pops up once the note has landed
+            b = self.buttons["PATCH_OK"]
+            for item in b["items"]:
+                c.itemconfig(item, state="normal")
+            b["scale"], b["kick"], b["sig"] = 0.4, 0.14, None
+            self.ripples.append([WIDTH / 2, 300, 5])
+            play(self.hover_sound)
+
+    def close_patch_notes(self):
+        if not self.patch:
+            return
+        self.canvas.delete("patchdyn")
+        self.canvas.itemconfig("patch", state="hidden")
+        self.patch = None
+        play(self.chat_close_sound)
+
     # --- the SPIN animation ---
     def spin(self):
         if self.spinning:
@@ -3754,7 +3916,7 @@ class Gester:
         for key, b in self.buttons.items():
             page = b["page"]
             if not (page == self.page or page == "chaticon" or (page == "chat" and self.chat_open)
-                    or (page == "leafwin" and self.lf_overlay)):
+                    or (page == "leafwin" and self.lf_overlay) or (page == "patch" and self.patch)):
                 continue
             hovered = key == self.hovered
             b["kick"] *= 0.8
@@ -3876,6 +4038,8 @@ class Gester:
     def _apply_page(self, name):
         """Show one page and hide the others."""
         was_leaves, was_emii = self.page == "leaves", self.page == "emii"
+        if self.patch:
+            self.close_patch_notes()
         self.page = name
         for page in ("home", "menu", "names", "sudoku", "themes", "board", "leaves", "emii"):
             self.canvas.itemconfig(page, state="normal" if page == name else "hidden")
@@ -4010,6 +4174,8 @@ class Gester:
             self.leaf_tick()
         if self.page == "emii" and self.em:
             self.em_tick()
+        if self.patch:
+            self.patch_tick()
 
         # sudoku page: rainbow title and lines, glowing selected square, victory rainbow
         if self.page == "sudoku":
